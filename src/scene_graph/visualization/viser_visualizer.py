@@ -1313,8 +1313,12 @@ class PipelineViserVisualizer:
         with contextlib.suppress(Exception):
             means_np = _to_numpy(state.get("means")).astype(np.float32, copy=False)
 
+        # `results` and the map's focus set are built from the exact same
+        # `scored` list, so the "Top matches" text and the boxes shown on the
+        # map always agree on both count and identity — no separate top-5 cap
+        # here (that used to make the text list shorter than the box set).
         results = []
-        for cand in scored[:5]:
+        for cand in scored:
             cap = ""
             oi = int(cand.object_index)
             if 0 <= oi < len(captions) and isinstance(captions[oi], str):
@@ -1324,13 +1328,14 @@ class PipelineViserVisualizer:
                 pos = tuple(float(v) for v in means_np[oi])
             results.append((int(cand.object_id), float(cand.composite_score), cap, pos))
 
-        # Focus set = target + confounders (every scored same-class candidate) +
-        # anchors (objects the spatial predicates reference). Everything else is
-        # faded so the target stands out.
-        candidate_ids: set[int] = set()
+        # Focus set = exactly the scored result objects. Anchors (objects the
+        # spatial predicates reference, e.g. the "table" in "mug on the
+        # table") are intentionally NOT added here — they're context, not
+        # results, and used only for the relation-edge overlay (edge_anchor_ids
+        # below), not for box visibility.
+        candidate_ids: set[int] = {int(cand.object_id) for cand in scored}
         anchor_ids: set[int] = set()
         for cand in scored:
-            candidate_ids.add(int(cand.object_id))
             # Per-candidate matched anchors (populated for regular predicates).
             for anchor_idx in (getattr(cand, "matched_anchors", {}) or {}).values():
                 if object_ids_np is not None and 0 <= int(anchor_idx) < object_ids_np.shape[0]:
@@ -1339,7 +1344,7 @@ class PipelineViserVisualizer:
         # also resolve anchor descriptions from the query graph directly.
         resolved_all, resolved_primary = self._anchor_object_ids(query_graph, object_ids_np)
         anchor_ids |= resolved_all
-        focus_ids = candidate_ids | anchor_ids
+        focus_ids = candidate_ids
 
         # Role assignment for the color coding (target > anchor > distractor)
         # and the relation edges from the top match to the anchors that
