@@ -1309,6 +1309,9 @@ class PipelineViserVisualizer:
         object_ids_np = None
         with contextlib.suppress(Exception):
             object_ids_np = _to_numpy(state.get("object_id")).astype(int, copy=False)
+        means_np = None
+        with contextlib.suppress(Exception):
+            means_np = _to_numpy(state.get("means")).astype(np.float32, copy=False)
 
         results = []
         for cand in scored[:5]:
@@ -1316,7 +1319,10 @@ class PipelineViserVisualizer:
             oi = int(cand.object_index)
             if 0 <= oi < len(captions) and isinstance(captions[oi], str):
                 cap = captions[oi]
-            results.append((int(cand.object_id), float(cand.composite_score), cap))
+            pos = None
+            if means_np is not None and means_np.ndim == 2 and 0 <= oi < means_np.shape[0]:
+                pos = tuple(float(v) for v in means_np[oi])
+            results.append((int(cand.object_id), float(cand.composite_score), cap, pos))
 
         # Focus set = target + confounders (every scored same-class candidate) +
         # anchors (objects the spatial predicates reference). Everything else is
@@ -1364,6 +1370,7 @@ class PipelineViserVisualizer:
                     dropped.append(f"{r.name}: {str(r.drop_reason).replace('_', ' ')}")
         roles = {
             "target": target_id,
+            "top_k": {oid for oid, _score, _cap, _pos in results},
             "anchors": anchor_ids - target_set,
             "distractors": candidate_ids - anchor_ids - target_set,
             "edges": sorted(edge_anchor_ids - target_set),
@@ -1454,9 +1461,10 @@ class PipelineViserVisualizer:
             lines.append(f"· ⚠ _{note} — constraint not applied_")
         lines.append("")
         lines.append("**Top matches:**")
-        for rank, (obj_id, score, caption) in enumerate(results, start=1):
+        for rank, (obj_id, score, caption, pos) in enumerate(results, start=1):
             cap = (caption or "(no caption)").strip()
-            lines.append(f"{rank}. `#{obj_id}` ({score:.3f}) — {cap}")
+            pos_str = f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})" if pos is not None else "(no position)"
+            lines.append(f"{rank}. `#{obj_id}` ({score:.3f}) — {pos_str} — {cap}")
         lines.append("")
         lines.append("_Others hidden — click **Reset view** to restore._")
         self._gui_set_markdown(self._query_results_display, "\n\n".join(lines))
@@ -3514,11 +3522,13 @@ class PipelineViserVisualizer:
             if is_locked:
                 rgb = np.clip((rgb.astype(np.float32) * 0.6 + 128 * 0.4), 0, 255).astype(np.uint8)
             opacity = 0.8 if is_locked else (0.58 if has_caption else 0.30)
-            # Query-role color coding: target #FFD45A, anchors #7FA8C6,
-            # distractors #AA98BA.
+            # Query-role color coding: top-k matches #FFD45A, anchors #7FA8C6,
+            # distractors #AA98BA. Every top-k result is highlighted gold, not
+            # just the single best match, so multiple candidates stand out at
+            # once after a query.
             roles = self._query_roles if self._focus_object_ids is not None else None
             if roles:
-                if obj_int == roles.get("target"):
+                if obj_int in (roles.get("top_k") or {roles.get("target")}):
                     rgb, opacity = np.array([255, 212, 90], dtype=np.uint8), 0.95
                 elif obj_int in (roles.get("anchors") or ()):
                     rgb, opacity = np.array([127, 168, 198], dtype=np.uint8), 0.75

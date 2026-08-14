@@ -64,6 +64,7 @@ def main() -> int:
                 else payload.get("state", payload)
             )
             captions = state.get("object_caption") or []
+            means = state.get("means")
             llm = LLMInterface(verbose=False)
             t0 = time.time()
             query_graph = parse_query(args.query, llm)
@@ -81,7 +82,11 @@ def main() -> int:
                 cap = (cap[:70] + "…") if len(cap) > 70 else cap
                 anchors = ", ".join(str(a) for a in (cand.matched_anchors or {}).values())
                 extra = f" anchors=[{anchors}]" if anchors else ""
-                print(f"  #{rank} object_id={cand.object_id} score={cand.composite_score:.3f}{extra} {cap!r}")
+                pos_str = "pos=?"
+                if means is not None and 0 <= cand.object_index < len(means):
+                    x, y, z = (float(v) for v in means[cand.object_index])
+                    pos_str = f"pos=({x:.2f}, {y:.2f}, {z:.2f})"
+                print(f"  #{rank} object_id={cand.object_id} score={cand.composite_score:.3f} {pos_str}{extra} {cap!r}")
             return 0
         except Exception as exc:  # noqa: BLE001 - degrade to embedding retrieval
             print(f"Relational path unavailable ({exc}); falling back to embedding retrieval.")
@@ -104,7 +109,9 @@ def main() -> int:
         for cand in candidates[:3]:
             caption = str(cand.get("caption") or cand.get("object_caption") or "")
             caption = (caption[:70] + "…") if len(caption) > 70 else caption
-            print(f"      object_id={cand.get('object_id')} score={cand.get('final_retrieval_score', 0.0):.3f} {caption!r}")
+            pos = cand.get("position") or [0.0, 0.0, 0.0]
+            pos_str = f"pos=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
+            print(f"      object_id={cand.get('object_id')} score={cand.get('final_retrieval_score', 0.0):.3f} {pos_str} {caption!r}")
     return 0
 
 
