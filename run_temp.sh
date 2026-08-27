@@ -178,17 +178,8 @@ case "${1:-}" in
     shell)
         require_compose
         shift || true
-        dataset_arg="${1:-${DATASET_DIR:-}}"
         volume_flags=()
-        if [[ -n "$dataset_arg" ]]; then
-            if [[ ! -d "$dataset_arg" ]]; then
-                echo "ERROR: dataset directory '$dataset_arg' does not exist." >&2
-                exit 1
-            fi
-            dataset_abs="$(cd "$dataset_arg" && pwd)"
-            volume_flags=(-v "${dataset_abs}:/data")
-            echo "[run.sh] mounting ${dataset_abs} -> /data"
-        fi
+        volume_flags=(-v "${SCRIPT_DIR}:/home/scene_graph/scene_graph")
         exec "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" run --rm "${volume_flags[@]}" scene-graph
         ;;
     vllm)

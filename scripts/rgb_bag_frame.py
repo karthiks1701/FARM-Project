@@ -90,9 +90,9 @@ from mapping.lib.image_decoding import decode_depth, decode_rgb  # noqa: E402
 # Z-forward). Replace with real calibration for anything beyond a smoke test.
 T_CAM_BODY = np.array(
     [
-        [0.0, -1.0, 0.0, 0.0],
-        [0.0, 0.0, -1.0, -0.3],
-        [1.0, 0.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0, -0.0159],
+        [0.0, 0.0, -1.0, -0.134],
+        [1.0, 0.0, 0.0, 0.2],
         [0.0, 0.0, 0.0, 1.0],
     ],
     dtype=np.float64,
@@ -298,7 +298,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 depth_size_mismatch_warned = True
 
             T_world_body = interpolate_pose(times, positions, quats, t_rgb)
-            T_world_cam = T_world_body @ T_body_cam
+            T_newworld_world = np.array([[  0.42432448 , -0.90544938 , -0.01049094 ,  3.41061322 ],
+                               [  0.90447486  , 0.42436484 , -0.04289210 , -5.04810494 ],
+                               [  0.04329086 ,  0.00871298,   0.99902464 , -0.31727900 ],
+                               [  0.0,          0.0,          0.0,          1.0        ],
+                               ],
+                               dtype=np.float64,
+                               )
+            T_world_cam = T_newworld_world @ T_world_body @ T_body_cam
 
             fid = f"{len(frames):06d}"
             rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)

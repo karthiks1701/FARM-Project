@@ -16,12 +16,14 @@ class CameraConfig:
 
 CAMERA_CONFIG: Dict[str, CameraConfig] = {
     "head_left": CameraConfig(
-        rgb_topic="/spot/camera/frontleft/image",
-        rgb_compressed_topic="/spot/camera/frontleft/image/compressed",
-        depth_topic="/spot/depth/frontleft/image",
-        rgb_info_topics=("/spot/camera/frontleft/camera_info",),
-        depth_info_topics=("/spot/depth/frontleft/camera_info",),
+        rgb_topic="/camera/frontleft/image",
+        rgb_compressed_topic="/camera/frontleft/image/compressed",
+        depth_topic="/depth/frontleft/image",
+        rgb_info_topics=("/camera/frontleft/camera_info",),
+        depth_info_topics=("/depth/frontleft/camera_info",),
         frame_ids=(
+            "frontleft_fisheye",
+            "frontleft",
             "head_left_rgbd_optical",
             "head_left_rgb_optical",
             "head_rgb_left_optical_frame",
@@ -31,12 +33,14 @@ CAMERA_CONFIG: Dict[str, CameraConfig] = {
         ),
     ),
     "head_right": CameraConfig(
-        rgb_topic="/spot/camera/frontright/image",
-        rgb_compressed_topic="/spot/camera/frontright/image/compressed",
-        depth_topic="/spot/depth/frontright/image",
-        rgb_info_topics=("/spot/camera/frontright/camera_info",),
-        depth_info_topics=("/spot/depth/frontright/camera_info",),
+        rgb_topic="/camera/frontright/image",
+        rgb_compressed_topic="/camera/frontright/image/compressed",
+        depth_topic="/depth/frontright/image",
+        rgb_info_topics=("/camera/frontright/camera_info",),
+        depth_info_topics=("/depth/frontright/camera_info",),
         frame_ids=(
+            "frontright_fisheye",
+            "frontright",
             "head_right_rgbd_optical",
             "head_right_rgb_optical",
             "head_rgb_right_optical_frame",
@@ -46,12 +50,14 @@ CAMERA_CONFIG: Dict[str, CameraConfig] = {
         ),
     ),
     "left": CameraConfig(
-        rgb_topic="/spot/camera/left/image",
-        rgb_compressed_topic="/spot/camera/left/image/compressed",
-        depth_topic="/spot/depth/left/image",
-        rgb_info_topics=("/spot/camera/left/camera_info",),
-        depth_info_topics=("/spot/depth/left/camera_info",),
+        rgb_topic="/camera/left/image",
+        rgb_compressed_topic="/camera/left/image/compressed",
+        depth_topic="/depth/left/image",
+        rgb_info_topics=("/camera/left/camera_info",),
+        depth_info_topics=("/depth/left/camera_info",),
         frame_ids=(
+            "left_fisheye",
+            "left",
             "left_rgbd_optical",
             "left_rgb_optical",
             "left_rgb_optical_frame",
@@ -60,12 +66,14 @@ CAMERA_CONFIG: Dict[str, CameraConfig] = {
         ),
     ),
     "right": CameraConfig(
-        rgb_topic="/spot/camera/right/image",
-        rgb_compressed_topic="/spot/camera/right/image/compressed",
-        depth_topic="/spot/depth/right/image",
-        rgb_info_topics=("/spot/camera/right/camera_info",),
-        depth_info_topics=("/spot/depth/right/camera_info",),
+        rgb_topic="/camera/right/image",
+        rgb_compressed_topic="/camera/right/image/compressed",
+        depth_topic="/depth/right/image",
+        rgb_info_topics=("/camera/right/camera_info",),
+        depth_info_topics=("/depth/right/camera_info",),
         frame_ids=(
+            "right_fisheye",
+            "right",
             "right_rgbd_optical",
             "right_rgb_optical",
             "right_rgb_optical_frame",
@@ -74,12 +82,14 @@ CAMERA_CONFIG: Dict[str, CameraConfig] = {
         ),
     ),
     "rear": CameraConfig(
-        rgb_topic="/spot/camera/back/image",
-        rgb_compressed_topic="/spot/camera/back/image/compressed",
-        depth_topic="/spot/depth/back/image",
-        rgb_info_topics=("/spot/camera/back/camera_info",),
-        depth_info_topics=("/spot/depth/back/camera_info",),
+        rgb_topic="/camera/back/image",
+        rgb_compressed_topic="/camera/back/image/compressed",
+        depth_topic="/depth/back/image",
+        rgb_info_topics=("/camera/back/camera_info",),
+        depth_info_topics=("/depth/back/camera_info",),
         frame_ids=(
+            "back_fisheye",
+            "back",
             "rear_rgbd_optical",
             "rear_rgb_optical",
             "rear_rgb_optical_frame",
@@ -102,3 +112,4 @@ CAMERA_CONFIG: Dict[str, CameraConfig] = {
 }
 
 __all__ = ["CameraConfig", "CAMERA_CONFIG"]
+
