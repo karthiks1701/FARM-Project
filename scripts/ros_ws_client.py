@@ -20,7 +20,7 @@ on a saved map.
     c.stop()
 
 Dependencies: ``websockets`` (already pulled in by ``viser``), ``numpy``,
-``Pillow`` (or ``opencv-python``) for JPEG decode.
+``Pillow`` (or ``opencv-python``) to decode the compressed (JPEG/PNG) image.
 """
 
 from __future__ import annotations
@@ -53,7 +53,8 @@ except Exception:  # pragma: no cover - standalone fallback
         )
 
 
-def _decode_jpeg(data: bytes) -> Optional[np.ndarray]:
+def _decode_image(data: bytes) -> Optional[np.ndarray]:
+    """Compressed image bytes (JPEG or PNG) -> HxWx3 uint8 RGB, or None."""
     try:
         import cv2
 
@@ -218,7 +219,7 @@ class RosWsClient:
     def _handle_image(self, header: dict, payload: bytes) -> None:
         if not payload:
             return
-        rgb = _decode_jpeg(payload)
+        rgb = _decode_image(payload)
         if rgb is None:
             return
         stamp = float(header.get("stamp") or time.time())

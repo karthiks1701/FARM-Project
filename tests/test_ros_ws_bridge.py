@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS) not in sys.path:
@@ -31,19 +30,22 @@ client_mod = _load("ros_ws_client")
 RosWsClient = client_mod.RosWsClient
 
 
-class _FakeImageMsg:
-    def __init__(self, rgb: np.ndarray, encoding: str):
-        h, w = rgb.shape[:2]
-        self.height, self.width = h, w
-        self.encoding = encoding
-        if encoding == "bgr8":
-            data = rgb[..., ::-1]
-        elif encoding == "mono8":
-            data = rgb[..., :1]
-        else:
-            data = rgb
-        self.step = w * data.shape[2]
-        self.data = np.ascontiguousarray(data).tobytes()
+def _png_bytes(rgb: np.ndarray) -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    bio = BytesIO()
+    Image.fromarray(rgb).save(bio, format="PNG")
+    return bio.getvalue()
+
+
+def _parse_frame(frame: bytes):
+    import json
+    import struct
+
+    (hlen,) = struct.unpack(">I", frame[:4])
+    return json.loads(frame[4 : 4 + hlen].decode("utf-8")), frame[4 + hlen :]
 
 
 def test_frame_roundtrip_odom():
@@ -107,20 +109,52 @@ def test_image_want_image_false_drops_frames():
     assert c.latest_image() == (None, None)
 
 
-@pytest.mark.parametrize("encoding", ["rgb8", "bgr8", "mono8"])
-def test_image_msg_to_rgb_encodings(encoding):
+def test_prepare_image_frame_jpeg_passthrough():
+    rng = np.random.default_rng(1)
+    rgb = rng.integers(0, 255, size=(40, 60, 3), dtype=np.uint8)
+    jpeg = bridge._encode_jpeg(rgb, max_side=0, quality=90)
+
+    frame = bridge._prepare_image_frame(
+        jpeg, "rgb8; jpeg compressed bgr8", stamp=5.0, frame_id="cam", max_side=0, quality=80
+    )
+    hdr, payload = _parse_frame(frame)
+    assert hdr["type"] == "image" and hdr["format"] == "jpeg" and hdr["stamp"] == 5.0
+    assert payload == jpeg  # bytes forwarded untouched, no re-encode
+
+    c = RosWsClient("ws://unused")
+    c._handle(frame)
+    _stamp, img = c.latest_image()
+    assert img.shape == (40, 60, 3)
+
+
+def test_prepare_image_frame_png_passthrough_and_client_decodes():
     rgb = np.dstack([
-        np.full((6, 5), 200, np.uint8),
-        np.full((6, 5), 100, np.uint8),
-        np.full((6, 5), 50, np.uint8),
+        np.full((12, 10), 200, np.uint8),
+        np.full((12, 10), 100, np.uint8),
+        np.full((12, 10), 50, np.uint8),
     ])
-    out = bridge._image_msg_to_rgb(_FakeImageMsg(rgb, encoding))
-    assert out.shape == (6, 5, 3)
-    assert out.flags["C_CONTIGUOUS"]
-    if encoding in ("rgb8", "bgr8"):
-        assert np.array_equal(out, rgb)
-    else:  # mono8 -> gray replicated across channels
-        assert np.array_equal(out[..., 0], out[..., 1])
+    png = _png_bytes(rgb)
+    frame = bridge._prepare_image_frame(png, "png", stamp=1.0, frame_id="c", max_side=0, quality=80)
+    hdr, payload = _parse_frame(frame)
+    assert hdr["format"] == "png" and payload == png
+
+    c = RosWsClient("ws://unused")
+    c._handle(frame)
+    _stamp, img = c.latest_image()
+    assert img.shape == (12, 10, 3)
+    assert np.array_equal(img, rgb)  # PNG is lossless
+
+
+def test_prepare_image_frame_reencodes_when_max_side_set():
+    rgb = (np.random.default_rng(2).random((120, 200, 3)) * 255).astype(np.uint8)
+    jpeg = bridge._encode_jpeg(rgb, max_side=0, quality=95)
+    frame = bridge._prepare_image_frame(
+        jpeg, "jpeg", stamp=2.0, frame_id="c", max_side=64, quality=70
+    )
+    hdr, payload = _parse_frame(frame)
+    assert hdr["format"] == "jpeg"
+    assert max(hdr["width"], hdr["height"]) <= 64  # downscaled
+    assert payload[:2] == b"\xff\xd8" and payload != jpeg  # a fresh, smaller JPEG
 
 
 def test_handle_ignores_short_or_garbage_frames():

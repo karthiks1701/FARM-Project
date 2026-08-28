@@ -1,32 +1,38 @@
 #!/usr/bin/env python3
 """ROS 2 -> WebSocket bridge. Runs on the robot/sensor host (e.g. 192.168.1.192).
 
-Subscribes to a ``nav_msgs/Odometry`` topic and a ``sensor_msgs/Image`` color
-topic, and pushes both to every connected WebSocket client. The viser host
+Subscribes to a ``nav_msgs/Odometry`` topic and a ``sensor_msgs/CompressedImage``
+color topic, and pushes both to every connected WebSocket client. The viser host
 (e.g. 192.168.1.212) runs ``scripts/ros_ws_client.py`` / ``view_scene_state.py
 --ws-url`` to receive them — no ROS install or cross-host DDS discovery needed
 on that side.
+
+The image is already JPEG on the wire (``.../image_raw/compressed``), so by
+default the bridge forwards those bytes **untouched** — zero decode/encode on
+the sender. Pass ``--image-max-side N`` to have it decode, downscale and
+re-encode instead. The client always decodes to RGB.
 
 Run on the host that HAS the topics::
 
     python scripts/ros_ws_bridge.py --host 0.0.0.0 --port 8765 \
         --odom-topic /odometry \
-        --image-topic /camera/camera/color/image_raw \
-        --image-max-fps 10 --image-max-side 640 --jpeg-quality 80
+        --image-topic /camera/camera/color/image_raw/compressed \
+        --image-max-fps 10
 
 Then on the viser host::
 
     python scripts/view_scene_state.py --pt scene.pt --ws-url ws://192.168.1.192:8765
 
 Dependencies here: ``rclpy`` (ROS 2), ``websockets`` (``pip install websockets``),
-``numpy``; ``opencv-python`` is used for JPEG encoding if present, else Pillow.
+``numpy``; ``opencv-python`` (or Pillow) is needed only when ``--image-max-side``
+forces a re-encode.
 
 Wire format — every message is one binary frame::
 
     [4 bytes big-endian uint32 = len(header)] [header: UTF-8 JSON] [payload bytes]
 
 ``header['type']`` is ``"odom"`` (payload empty; pose in the header) or
-``"image"`` (payload = JPEG bytes).
+``"image"`` (payload = JPEG/PNG bytes; ``header['format']`` says which).
 """
 
 from __future__ import annotations
@@ -46,21 +52,21 @@ import numpy as np
 # ----------------------------------------------------------------------------
 # image helpers (no cv_bridge dependency)
 # ----------------------------------------------------------------------------
-def _image_msg_to_rgb(msg) -> np.ndarray:
-    """``sensor_msgs/Image`` -> contiguous HxWx3 uint8 RGB."""
-    h, w, step = int(msg.height), int(msg.width), int(msg.step)
-    enc = str(msg.encoding).lower()
-    buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-    if enc in ("rgb8", "bgr8"):
-        rows = buf.reshape(h, step)[:, : w * 3].reshape(h, w, 3)
-        return np.ascontiguousarray(rows[..., ::-1] if enc == "bgr8" else rows)
-    if enc in ("rgba8", "bgra8"):
-        rows = buf.reshape(h, step)[:, : w * 4].reshape(h, w, 4)[..., :3]
-        return np.ascontiguousarray(rows[..., ::-1] if enc == "bgra8" else rows)
-    if enc in ("mono8", "8uc1"):
-        rows = buf.reshape(h, step)[:, :w].reshape(h, w, 1)
-        return np.ascontiguousarray(np.repeat(rows, 3, axis=2))
-    raise ValueError(f"unsupported image encoding {msg.encoding!r} (want rgb8/bgr8/rgba8/bgra8/mono8)")
+def _decode_compressed(data: bytes) -> np.ndarray:
+    """``sensor_msgs/CompressedImage`` payload (JPEG or PNG bytes) -> HxWx3 uint8 RGB."""
+    try:
+        import cv2
+
+        arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if arr is None:
+            raise RuntimeError("cv2.imdecode returned None")
+        return np.ascontiguousarray(arr[..., ::-1])  # BGR -> RGB
+    except Exception:
+        from io import BytesIO
+
+        from PIL import Image
+
+        return np.asarray(Image.open(BytesIO(data)).convert("RGB"))
 
 
 def _encode_jpeg(rgb: np.ndarray, max_side: int, quality: int) -> bytes:
@@ -92,6 +98,64 @@ def _encode_jpeg(rgb: np.ndarray, max_side: int, quality: int) -> bytes:
 def _frame(header: dict, payload: bytes = b"") -> bytes:
     hb = json.dumps(header, separators=(",", ":")).encode("utf-8")
     return struct.pack(">I", len(hb)) + hb + payload
+
+
+def _prepare_image_frame(
+    data: bytes,
+    fmt: str,
+    *,
+    stamp: float,
+    frame_id: str,
+    max_side: int,
+    quality: int,
+) -> bytes:
+    """Build one ``type=image`` wire frame from a ``CompressedImage`` payload.
+
+    Fast path (``max_side <= 0``): forward the already-compressed JPEG/PNG bytes
+    untouched — no decode on the sender. Otherwise decode, downscale so the
+    longest side is ``max_side``, and re-encode JPEG.
+    """
+    fmt_l = str(fmt).lower()
+    is_jpeg = "jpeg" in fmt_l or "jpg" in fmt_l
+    is_png = "png" in fmt_l
+
+    if max_side <= 0 and (is_jpeg or is_png):
+        header = {
+            "type": "image",
+            "stamp": float(stamp),
+            "frame_id": str(frame_id),
+            "format": "jpeg" if is_jpeg else "png",
+            "width": 0,
+            "height": 0,  # not decoded on the sender; the client reads it from the pixels
+        }
+        return _frame(header, data)
+
+    try:
+        rgb = _decode_compressed(data)
+    except Exception:
+        if is_jpeg or is_png:  # can't decode here but the client can — forward as-is
+            header = {
+                "type": "image", "stamp": float(stamp), "frame_id": str(frame_id),
+                "format": "jpeg" if is_jpeg else "png", "width": 0, "height": 0,
+            }
+            return _frame(header, data)
+        raise
+    h, w = rgb.shape[:2]
+    if max_side > 0 and max(h, w) > max_side:  # mirror _encode_jpeg's internal resize
+        scale = float(max_side) / float(max(h, w))
+        out_w, out_h = max(1, int(w * scale)), max(1, int(h * scale))
+    else:
+        out_w, out_h = w, h
+    jpeg = _encode_jpeg(rgb, max_side, quality)
+    header = {
+        "type": "image",
+        "stamp": float(stamp),
+        "frame_id": str(frame_id),
+        "format": "jpeg",
+        "width": int(out_w),
+        "height": int(out_h),
+    }
+    return _frame(header, jpeg)
 
 
 # ----------------------------------------------------------------------------
@@ -134,7 +198,7 @@ class _RosBridgeNode:
         from rclpy.node import Node
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
         from nav_msgs.msg import Odometry
-        from sensor_msgs.msg import Image
+        from sensor_msgs.msg import CompressedImage
 
         a = self._args
         if a.ros_domain_id is not None:
@@ -149,7 +213,7 @@ class _RosBridgeNode:
             return QoSProfile(depth=10, reliability=rel, durability=DurabilityPolicy.VOLATILE, history=HistoryPolicy.KEEP_LAST)
 
         node.create_subscription(Odometry, a.odom_topic, self._on_odom, _qos(a.odom_qos))
-        node.create_subscription(Image, a.image_topic, self._on_image, _qos(a.image_qos))
+        node.create_subscription(CompressedImage, a.image_topic, self._on_image, _qos(a.image_qos))
         node.get_logger().info(
             f"[ros_ws_bridge] odom={a.odom_topic!r} image={a.image_topic!r} "
             f"domain={os.environ.get('ROS_DOMAIN_ID', '0')}"
@@ -196,23 +260,20 @@ class _RosBridgeNode:
         now = time.monotonic()
         if a.image_max_fps > 0 and (now - self._last_image_s) < (1.0 / a.image_max_fps):
             return
+        st = msg.header.stamp
         try:
-            rgb = _image_msg_to_rgb(msg)
-            jpeg = _encode_jpeg(rgb, a.image_max_side, a.jpeg_quality)
+            frame = _prepare_image_frame(
+                bytes(msg.data),
+                getattr(msg, "format", "jpeg"),
+                stamp=float(st.sec) + float(st.nanosec) * 1e-9,
+                frame_id=str(msg.header.frame_id),
+                max_side=a.image_max_side,
+                quality=a.jpeg_quality,
+            )
         except Exception as exc:  # noqa: BLE001
-            print(f"[ros_ws_bridge] image encode skipped: {exc}")
+            print(f"[ros_ws_bridge] image frame skipped: {exc}")
             return
         self._last_image_s = now
-        st = msg.header.stamp
-        header = {
-            "type": "image",
-            "stamp": float(st.sec) + float(st.nanosec) * 1e-9,
-            "frame_id": str(msg.header.frame_id),
-            "format": "jpeg",
-            "width": int(rgb.shape[1]),
-            "height": int(rgb.shape[0]),
-        }
-        frame = _frame(header, jpeg)
         self._loop.call_soon_threadsafe(self._img_slot.set, frame)
 
 
@@ -296,13 +357,16 @@ def main() -> int:
     ap.add_argument("--host", default="0.0.0.0", help="Interface to bind the WebSocket server on")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--odom-topic", default="/odometry")
-    ap.add_argument("--image-topic", default="/camera/camera/color/image_raw")
+    ap.add_argument("--image-topic", default="/camera/camera/color/image_raw/compressed",
+                    help="sensor_msgs/CompressedImage topic (JPEG/PNG on the wire)")
     ap.add_argument("--odom-qos", choices=("reliable", "best_effort"), default="reliable")
     ap.add_argument("--image-qos", choices=("reliable", "best_effort"), default="best_effort",
                     help="RealSense image topics are usually best_effort")
     ap.add_argument("--image-max-fps", type=float, default=10.0, help="Cap forwarded image rate (0 = no cap)")
-    ap.add_argument("--image-max-side", type=int, default=640, help="Downscale so the longest image side <= this (0 = keep)")
-    ap.add_argument("--jpeg-quality", type=int, default=80)
+    ap.add_argument("--image-max-side", type=int, default=0,
+                    help="0 (default) = forward the compressed bytes untouched (no decode on the sender). "
+                    ">0 = decode, downscale so the longest side <= this, and re-encode JPEG.")
+    ap.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality when re-encoding (only used with --image-max-side > 0)")
     ap.add_argument("--ros-domain-id", type=int, default=None)
     args = ap.parse_args()
     try:
