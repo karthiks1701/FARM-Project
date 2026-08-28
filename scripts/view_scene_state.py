@@ -27,7 +27,9 @@ Examples (inside the container)::
 ``--ws-url ws://<robot-host>:8765`` streams a remote robot's ``/odometry``
 (live ``/robot_pose`` frame + trail) and color image (**Live RGB** panel) from a
 ``scripts/ros_ws_bridge.py`` running on that host — no ROS on this machine.
-``--world-transform`` aligns the odometry exactly as for ``--odom-topic``.
+Live odometry is aligned to the map by ``DEFAULT_SEED_TFORM_BODY`` (a
+``seed_tform_body`` baked into this script); override with ``--world-transform``
+/ ``--world-transform-se3`` or disable with ``--no-world-transform``.
 
 A metric ground grid is drawn by default (``--no-grid`` to suppress, or toggle
 it in the **Metric grid** GUI panel). ``--walk`` overlays a Boston Dynamics
@@ -52,6 +54,37 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+
+# Default map alignment for live odometry (``--ws-url`` / ``--odom-topic``):
+# Spot ``seed_tform_body`` (SE3Pose — translation + quaternion in Boston
+# Dynamics x,y,z,w order). Used when neither ``--world-transform`` nor
+# ``--world-transform-se3`` is given, and the scene state carries none.
+# Override on the CLI, or pass ``--no-world-transform`` to align 1:1.
+DEFAULT_SEED_TFORM_BODY = {
+    "position": (2.2729322207071028, 0.19774609072594404, -0.53609861630672606),
+    "rotation_xyzw": (
+        0.0047556974067231462,
+        0.003794053310715498,
+        0.99953135411525507,
+        0.030001010685907416,
+    ),
+}
+
+
+def se3_to_matrix(x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Row-major 4x4 from a translation + quaternion (x, y, z, w order)."""
+    n = qx * qx + qy * qy + qz * qz + qw * qw
+    s = 2.0 / n if n > 1e-12 else 0.0
+    return np.array(
+        [
+            [1 - s * (qy * qy + qz * qz), s * (qx * qy - qz * qw), s * (qx * qz + qy * qw), x],
+            [s * (qx * qy + qz * qw), 1 - s * (qx * qx + qz * qz), s * (qy * qz - qx * qw), y],
+            [s * (qx * qz - qy * qw), s * (qy * qz + qx * qw), 1 - s * (qx * qx + qy * qy), z],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
 
 
 def load_state(pt_path: Path) -> dict:
@@ -150,6 +183,9 @@ def main() -> int:
     parser.add_argument("--query-examples", type=Path, default=None, help="Text file with one query per line for the Query panel's Examples dropdown (default: derive examples from the scene's own captioned objects)")
     parser.add_argument("--ws-url", default=None, help="WebSocket URL of a scripts/ros_ws_bridge.py running on the robot host (e.g. ws://192.168.1.192:8765). Streams /odometry (robot pose + trail) and the color image (Live RGB panel) without ROS on this machine. --world-transform aligns the odometry like --odom-topic.")
     parser.add_argument("--ws-no-image", action="store_true", help="With --ws-url, ignore the streamed camera image (odometry only)")
+    parser.add_argument("--ws-odom-color", type=int, nargs=3, default=(236, 64, 200), metavar=("R", "G", "B"), help="RGB colour (0-255) for the WebSocket odometry trail + axes")
+    parser.add_argument("--ws-odom-axes-spacing-m", type=float, default=0.5, help="Drop an orientation axes triad every this many metres along the WebSocket odometry trail")
+    parser.add_argument("--ws-odom-axes-length", type=float, default=0.18, help="Length (m) of the WebSocket odometry axes triads")
     parser.add_argument("--odom-topic", default=None, help="Subscribe to this ROS 2 nav_msgs/Odometry topic (e.g. /odometry) and draw the robot's live pose + trail in the scene; each Query press also drops a marker where the robot was")
     parser.add_argument("--ros-domain-id", type=int, default=None, help="ROS_DOMAIN_ID for the --odom-topic subscription (default: current env)")
     parser.add_argument("--odom-qos", choices=("reliable", "best_effort"), default="reliable", help="QoS reliability for --odom-topic (Spot's driver often needs best_effort)")
@@ -162,6 +198,21 @@ def main() -> int:
         metavar="M",
         help="Row-major 4x4 T_map_odom applied to every live odometry pose before drawing "
         "(use the SAME matrix passed to scripts/rgb_bag_frame.py --world-transform, e.g. seed_tform_body)",
+    )
+    parser.add_argument(
+        "--world-transform-se3",
+        type=float,
+        nargs=7,
+        default=None,
+        metavar=("X", "Y", "Z", "QX", "QY", "QZ", "QW"),
+        help="Same as --world-transform but as an SE3Pose: translation x y z then quaternion "
+        "qx qy qz qw (Boston Dynamics order). Handy for pasting a Spot seed_tform_body.",
+    )
+    parser.add_argument(
+        "--no-world-transform",
+        action="store_true",
+        help="Ignore the built-in DEFAULT_SEED_TFORM_BODY (and any stored transform): draw live "
+        "odometry 1:1 in its own frame.",
     )
     args = parser.parse_args()
 
@@ -265,12 +316,28 @@ def main() -> int:
             print(f"Skipping nav graph ({exc})")
 
     # Shared alignment for any live odometry source (--odom-topic or --ws-url).
+    # Priority: --world-transform > --world-transform-se3 > stored in the scene
+    # state > built-in DEFAULT_SEED_TFORM_BODY. --no-world-transform forces 1:1.
     world_transform = None
-    if args.world_transform is not None:
+    if args.no_world_transform:
+        print("Live odometry alignment: none (--no-world-transform)")
+    elif args.world_transform is not None:
         world_transform = np.asarray(args.world_transform, dtype=np.float64).reshape(4, 4)
+        print("Live odometry alignment: --world-transform (4x4)")
+    elif args.world_transform_se3 is not None:
+        world_transform = se3_to_matrix(*(float(v) for v in args.world_transform_se3))
+        print("Live odometry alignment: --world-transform-se3")
     elif isinstance(state.get("world_transform"), (list, np.ndarray)):
         world_transform = np.asarray(state["world_transform"], dtype=np.float64).reshape(4, 4)
-        print("Using world_transform stored in the scene state for live odometry alignment")
+        print("Live odometry alignment: world_transform stored in the scene state")
+    else:
+        px, py, pz = DEFAULT_SEED_TFORM_BODY["position"]
+        world_transform = se3_to_matrix(px, py, pz, *DEFAULT_SEED_TFORM_BODY["rotation_xyzw"])
+        print(
+            f"Live odometry alignment: built-in DEFAULT_SEED_TFORM_BODY "
+            f"t=({px:.3f}, {py:.3f}, {pz:.3f}) (override with --world-transform*, "
+            f"disable with --no-world-transform)"
+        )
 
     ws_client = None
     if args.ws_url:
@@ -327,7 +394,13 @@ def main() -> int:
             if ws_client is not None:
                 stamp, pose = ws_client.latest_odom()
                 if pose is not None:
-                    visualizer.set_robot_pose(pose, stamp=stamp)
+                    visualizer.add_live_odometry_pose(
+                        pose,
+                        stamp=stamp,
+                        color=tuple(args.ws_odom_color),
+                        axes_spacing_m=args.ws_odom_axes_spacing_m,
+                        axes_length=args.ws_odom_axes_length,
+                    )
                 if not args.ws_no_image:
                     istamp, image = ws_client.latest_image()
                     if image is not None and istamp != last_image_stamp:

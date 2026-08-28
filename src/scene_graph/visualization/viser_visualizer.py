@@ -295,6 +295,26 @@ class PipelineViserVisualizer:
         self._robot_pose_frame = None
         self._live_robot_pose: np.ndarray | None = None
         self._live_robot_stamp: float | None = None
+        # Separate live-odometry overlay (e.g. the WebSocket /odometry stream):
+        # its own coloured trail + periodic orientation axes, kept distinct from
+        # the red /robot_trajectory so both can be shown at once.
+        self._live_odom_positions: list[np.ndarray] = []
+        self._live_odom_wxyz: list[np.ndarray] = []
+        self._live_odom_stamps: list[float] = []
+        self._live_odom_max_points: int = 20000
+        self._live_odom_min_step_m: float = 0.01
+        self._live_odom_color: tuple[int, int, int] = (236, 64, 200)
+        self._live_odom_axes_spacing_m: float = 0.5
+        self._live_odom_axes_length: float = 0.18
+        self._live_odom_max_axes: int = 800
+        self._live_odom_show: bool = True
+        self._live_odom_trail_handle = None
+        self._live_odom_axes_handle = None
+        self._live_odom_current_frame = None
+        self._live_odom_gui_ready: bool = False
+        self._live_odom_show_checkbox = None
+        self._live_odom_spacing_slider = None
+        self._live_odom_size_slider = None
         self._query_pose_handles: list = []
         self._query_pose_count: int = 0
         # Collision-aware navigation-pose markers drawn in the 3D scene after a
@@ -2907,6 +2927,194 @@ class PipelineViserVisualizer:
                     self._robot_pose_frame.position = translation
                 self._append_robot_trajectory_point(translation)
             self._server.flush()
+
+    # ------------------------------------------------------------------
+    # Live-odometry overlay (own colour + orientation axes)
+    # ------------------------------------------------------------------
+    def add_live_odometry_pose(
+        self,
+        T_world_robot: np.ndarray,
+        *,
+        stamp: float | None = None,
+        color: Sequence[int] | None = None,
+        axes_spacing_m: float | None = None,
+        axes_length: float | None = None,
+    ) -> None:
+        """Append one pose to a dedicated live-odometry overlay: a coloured
+        trail (``/live_odom/trail``), coordinate-frame axes dropped every
+        ``axes_spacing_m`` along it (``/live_odom/axes``), and a larger frame at
+        the current pose (``/live_odom/current``).
+
+        Distinct from :meth:`set_robot_pose` / ``/robot_trajectory`` so a
+        WebSocket ``/odometry`` stream shows in its own colour with heading
+        axes, alongside anything else. ``T_world_robot`` is a 4x4 body-to-world
+        transform already in the map frame. A **Live odometry** GUI folder
+        toggles it and tunes the axes.
+        """
+        if not self._enabled or self._server is None:
+            return
+        try:
+            T = np.asarray(T_world_robot, dtype=np.float64).reshape(4, 4)
+        except Exception:
+            return
+        if T.shape != (4, 4) or not np.all(np.isfinite(T)):
+            return
+        # Keep the shared "last known robot pose" fresh so a query still drops a
+        # marker where the robot was, even though this overlay owns the trail.
+        self._live_robot_pose = T.astype(np.float32)
+        self._live_robot_stamp = stamp
+        if color is not None:
+            with contextlib.suppress(Exception):
+                self._live_odom_color = tuple(int(np.clip(c, 0, 255)) for c in tuple(color)[:3])  # type: ignore[assignment]
+        if axes_spacing_m is not None:
+            self._live_odom_axes_spacing_m = max(0.05, float(axes_spacing_m))
+        if axes_length is not None:
+            self._live_odom_axes_length = max(0.02, float(axes_length))
+
+        pos = T[:3, 3].astype(np.float32)
+        if self._live_odom_positions:
+            if float(np.linalg.norm(pos - self._live_odom_positions[-1])) < self._live_odom_min_step_m:
+                # Still refresh the "current" frame so heading stays live.
+                self._update_live_odom_current(T)
+                return
+        wxyz = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        if SO3 is not None:
+            with contextlib.suppress(Exception):
+                wxyz = np.asarray(SO3.from_matrix(T[:3, :3]).wxyz, dtype=np.float32).reshape(4)
+        self._live_odom_positions.append(pos)
+        self._live_odom_wxyz.append(wxyz)
+        self._live_odom_stamps.append(float(stamp) if stamp is not None else 0.0)
+        if len(self._live_odom_positions) > self._live_odom_max_points:
+            drop = len(self._live_odom_positions) - self._live_odom_max_points
+            del self._live_odom_positions[:drop]
+            del self._live_odom_wxyz[:drop]
+            del self._live_odom_stamps[:drop]
+
+        self._setup_live_odom_gui()
+        self._redraw_live_odometry(current_T=T)
+
+    def _update_live_odom_current(self, T: np.ndarray) -> None:
+        if self._server is None or not self._live_odom_show:
+            return
+        length = float(self._live_odom_axes_length) * 1.8
+        with contextlib.suppress(Exception):
+            with self._server.atomic():
+                if self._live_odom_current_frame is None:
+                    self._live_odom_current_frame = self._server.scene.add_frame(
+                        name="/live_odom/current", axes_length=length,
+                        axes_radius=max(0.006, length * 0.06),
+                    )
+                if SO3 is not None and hasattr(self._live_odom_current_frame, "wxyz"):
+                    self._live_odom_current_frame.wxyz = SO3.from_matrix(np.asarray(T[:3, :3])).wxyz
+                if hasattr(self._live_odom_current_frame, "position"):
+                    self._live_odom_current_frame.position = np.asarray(T[:3, 3], dtype=np.float32)
+            self._server.flush()
+
+    @staticmethod
+    def _arclength_keep_indices(positions: np.ndarray, spacing: float, cap: int) -> list[int]:
+        if positions.shape[0] <= 2:
+            return list(range(positions.shape[0]))
+        keep = [0]
+        acc = 0.0
+        for i in range(1, positions.shape[0]):
+            acc += float(np.linalg.norm(positions[i] - positions[i - 1]))
+            if acc >= spacing:
+                keep.append(i)
+                acc = 0.0
+        if keep[-1] != positions.shape[0] - 1:
+            keep.append(positions.shape[0] - 1)
+        if len(keep) > cap:  # thin uniformly, always keeping the last
+            idx = np.linspace(0, len(keep) - 1, cap).round().astype(int)
+            keep = sorted(set(keep[i] for i in idx) | {keep[-1]})
+        return keep
+
+    def _redraw_live_odometry(self, *, current_T: np.ndarray | None = None) -> None:
+        if self._server is None:
+            return
+        for attr in ("_live_odom_trail_handle", "_live_odom_axes_handle"):
+            h = getattr(self, attr, None)
+            if h is not None:
+                with contextlib.suppress(Exception):
+                    h.remove()
+                setattr(self, attr, None)
+        if not self._live_odom_show or len(self._live_odom_positions) < 1:
+            if self._live_odom_current_frame is not None:
+                with contextlib.suppress(Exception):
+                    self._live_odom_current_frame.remove()
+                self._live_odom_current_frame = None
+            with contextlib.suppress(Exception):
+                self._server.flush()
+            return
+
+        positions = np.stack(self._live_odom_positions, axis=0).astype(np.float32, copy=False)
+        color = np.array(self._live_odom_color, dtype=np.uint8)
+        with contextlib.suppress(Exception):
+            with self._server.atomic():
+                if positions.shape[0] >= 2:
+                    seg = np.stack([positions[:-1], positions[1:]], axis=1)
+                    self._live_odom_trail_handle = self._server.scene.add_line_segments(
+                        name="/live_odom/trail",
+                        points=seg,
+                        colors=np.tile(color, (seg.shape[0], 2, 1)),
+                        line_width=3.0,
+                    )
+                keep = self._arclength_keep_indices(
+                    positions, float(self._live_odom_axes_spacing_m), self._live_odom_max_axes
+                )
+                if keep:
+                    ax_pos = positions[keep]
+                    ax_wxyz = np.stack([self._live_odom_wxyz[i] for i in keep], axis=0).astype(np.float32)
+                    ln = float(self._live_odom_axes_length)
+                    self._live_odom_axes_handle = self._server.scene.add_batched_axes(
+                        "/live_odom/axes",
+                        batched_wxyzs=ax_wxyz,
+                        batched_positions=np.ascontiguousarray(ax_pos),
+                        axes_length=ln,
+                        axes_radius=max(0.004, ln * 0.06),
+                    )
+            self._server.flush()
+
+        if current_T is not None:
+            self._update_live_odom_current(current_T)
+
+    def _setup_live_odom_gui(self) -> None:
+        if self._live_odom_gui_ready or self._server is None:
+            return
+        gui = getattr(self._server, "gui", None)
+        if gui is None:
+            return
+        try:
+            with gui.add_folder("Live odometry"):
+                self._live_odom_show_checkbox = self._gui_add_checkbox(gui, "Show live odometry", self._live_odom_show)
+                self._live_odom_spacing_slider = self._gui_add_slider(
+                    gui, "Axes spacing (m)", min_v=0.1, max_v=3.0, step=0.1, initial=self._live_odom_axes_spacing_m
+                )
+                self._live_odom_size_slider = self._gui_add_slider(
+                    gui, "Axes size (m)", min_v=0.05, max_v=0.6, step=0.01, initial=self._live_odom_axes_length
+                )
+        except Exception:
+            return
+        self._live_odom_gui_ready = True
+        for handle in (self._live_odom_show_checkbox, self._live_odom_spacing_slider, self._live_odom_size_slider):
+            on_update = getattr(handle, "on_update", None)
+            if callable(on_update):
+                with contextlib.suppress(Exception):
+
+                    @on_update
+                    def _(_event=None):
+                        self._handle_live_odom_gui_changed()
+
+    def _handle_live_odom_gui_changed(self) -> None:
+        with contextlib.suppress(Exception):
+            if self._live_odom_show_checkbox is not None:
+                self._live_odom_show = bool(self._live_odom_show_checkbox.value)
+        with contextlib.suppress(Exception):
+            if self._live_odom_spacing_slider is not None:
+                self._live_odom_axes_spacing_m = max(0.05, float(self._live_odom_spacing_slider.value))
+        with contextlib.suppress(Exception):
+            if self._live_odom_size_slider is not None:
+                self._live_odom_axes_length = max(0.02, float(self._live_odom_size_slider.value))
+        self._redraw_live_odometry()
 
     def mark_query_pose(self, label: str, T_world_robot: np.ndarray | None = None) -> None:
         """Drop a persistent marker at the robot's position for a query event, so
