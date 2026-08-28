@@ -1,0 +1,109 @@
+"""Tests for the collision-aware navigation-pose resolver."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from scene_graph.retrieval.navigation_pose import (
+    NavigationPose,
+    compute_navigation_pose,
+    decode_object_voxel_points,
+    navigation_poses_for_scene,
+)
+
+
+def _wall_points(x: float, y0: float, y1: float, z: float = 0.0, n: int = 120) -> np.ndarray:
+    ys = np.linspace(y0, y1, n)
+    return np.stack([np.full(n, x), ys, np.full(n, z)], axis=1)
+
+
+def test_pose_clears_robot_radius_plus_barrier():
+    # Target at origin; one obstacle object forms a wall at x = 0.6.
+    means = np.array([[0.0, 0.0, 0.0], [0.6, 0.0, 0.0]], dtype=np.float64)
+    obs = _wall_points(0.6, -3.0, 3.0)
+    pts = np.concatenate([np.zeros((1, 3)), obs], axis=0)
+    owner = np.concatenate([np.zeros(1, np.int64), np.ones(len(obs), np.int64)])
+
+    nav = compute_navigation_pose(
+        0, means=means, voxel_points=pts, voxel_owner=owner,
+        clearance_margin_m=0.10, robot_radius_m=0.5, search_radius_m=3.0, n_angles=72,
+    )
+    assert isinstance(nav, NavigationPose)
+    assert nav.navigable
+    assert nav.required_clearance_m == 0.6
+    assert nav.clearance_m >= 0.6 - 1e-6
+    # Must not be placed on the obstacle side (x should be <= wall - required).
+    assert nav.position[0] <= 0.6 - 0.6 + 1e-6
+    # Heading points back at the target (origin).
+    dx = math.cos(nav.yaw_rad)
+    dy = math.sin(nav.yaw_rad)
+    to_target = np.array([0.0, 0.0]) - np.array(nav.position[:2])
+    to_target /= np.linalg.norm(to_target)
+    assert np.dot([dx, dy], to_target) > 0.95
+
+
+def test_flags_unnavigable_when_boxed_in():
+    # Target buried in a thick annulus of obstacle clutter (r 0.3..1.6 m) on all
+    # sides -> a 0.5 m robot has no body-safe pose within the search radius; a
+    # pose is still returned, flagged navigable=False.
+    means = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float64)
+    rng = np.random.default_rng(1)
+    n = 4000
+    rad = rng.uniform(0.3, 1.6, size=n)
+    ang = rng.uniform(0, 2 * math.pi, size=n)
+    clutter = np.stack([rad * np.cos(ang), rad * np.sin(ang), np.zeros(n)], axis=1)
+    owner = np.ones(n, np.int64)  # all belong to object 1
+    nav = compute_navigation_pose(
+        0, means=means, voxel_points=clutter, voxel_owner=owner,
+        clearance_margin_m=0.10, robot_radius_m=0.5, search_radius_m=0.8,
+    )
+    assert not nav.navigable
+    assert nav.clearance_m < nav.required_clearance_m
+    assert "NO body-safe pose" in nav.note
+
+
+def test_no_obstacles_returns_infinite_clearance():
+    means = np.array([[1.0, 2.0, 0.5]], dtype=np.float64)
+    nav = compute_navigation_pose(
+        0, means=means,
+        voxel_points=np.zeros((0, 3)), voxel_owner=np.zeros((0,), np.int64),
+        robot_radius_m=0.5,
+    )
+    assert nav.navigable
+    assert math.isinf(nav.clearance_m)
+    assert nav.target_position == (1.0, 2.0, 0.5)
+    # vertical component preserved from the target centroid
+    assert abs(nav.position[2] - 0.5) < 1e-9
+
+
+def test_self_voxels_never_count_as_obstacles():
+    # Big target blob + a far obstacle: clearance is measured to the obstacle,
+    # not to the target's own voxels, so the pose sits just outside the blob.
+    rng = np.random.default_rng(0)
+    blob = rng.uniform(-0.4, 0.4, size=(300, 3))
+    blob[:, 2] = 0.0
+    far = _wall_points(5.0, -2.0, 2.0)
+    pts = np.concatenate([blob, far], axis=0)
+    owner = np.concatenate([np.zeros(len(blob), np.int64), np.ones(len(far), np.int64)])
+    means = np.array([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], dtype=np.float64)
+    nav = compute_navigation_pose(
+        0, means=means, voxel_points=pts, voxel_owner=owner,
+        robot_radius_m=0.3, clearance_margin_m=0.1, search_radius_m=2.0,
+    )
+    assert nav.navigable
+    # Close to the target (just outside its ~0.55 m reach), far from the wall.
+    assert nav.offset_from_target_m < 1.5
+    assert nav.clearance_m > 1.0
+
+
+def test_decode_and_scene_helper_smoke():
+    # No voxel buffers -> empty decode, helper still returns a pose per index
+    # (infinite clearance, since there are no obstacles).
+    state = {"means": np.array([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=np.float64)}
+    pts, owner = decode_object_voxel_points(state)
+    assert pts.shape == (0, 3) and owner.shape == (0,)
+    out = navigation_poses_for_scene(state, [0, 1], robot_radius_m=0.5)
+    assert set(out) == {0, 1}
+    assert all(p.navigable for p in out.values())

@@ -20,6 +20,19 @@ Examples (inside the container)::
         --pt /data/scene_graphs/grandtour/2024-11-25_warehouse.pt \
         --cloud /data/scenes/grandtour/2024-11-25_warehouse/cloud.npz
 
+    # Overlay a Spot Autowalk nav graph + a 1 m metric ground grid
+    python scripts/view_scene_state.py --pt /data/out/site.pt \
+        --walk /data/walks/site.walk --grid-cell-m 1.0
+
+A metric ground grid is drawn by default (``--no-grid`` to suppress, or toggle
+it in the **Metric grid** GUI panel). ``--walk`` overlays a Boston Dynamics
+GraphNav / Autowalk ``.walk`` map: one coordinate frame per waypoint pose,
+connecting edges, waypoint-name labels, and anchored fiducials, toggled in the
+**Nav graph** panel. Needs ``bosdyn-api`` (``pip install bosdyn-api`` — protobuf
+only). Waypoint poses come from the map's anchoring (``--walk-anchor seed``) or a
+BFS over edge transforms (``--walk-anchor bfs``); ``auto`` picks anchoring when
+the map has it.
+
 Then open http://localhost:8080. For language queries, either click
 "Start vLLM retrieval backend" in the Query panel (launches the servers on
 this machine) or run ``./run.sh vllm`` first / point ``VLLM_BASE_URL`` +
@@ -124,7 +137,25 @@ def main() -> int:
     parser.add_argument("--point-size", type=float, default=0.02, help="Background cloud point size (m)")
     parser.add_argument("--max-cloud-points", type=int, default=2_000_000, help="Random-subsample the background cloud to this many points (0 = keep all)")
     parser.add_argument("--voxel-points-per-object", type=int, default=0, help="Per-object voxel evidence points to render (0 = clean default: boxes + cloud + trajectory only)")
+    parser.add_argument("--walk", type=Path, default=None, help="Spot GraphNav / Autowalk '.walk' directory (or its 'graph' protobuf) to overlay: one coordinate frame per waypoint pose, connecting edges, name labels, and anchored fiducials. Toggle in the 'Nav graph' GUI panel.")
+    parser.add_argument("--walk-anchor", choices=("auto", "seed", "bfs"), default="auto", help="How to lift waypoint poses into one frame: 'auto' uses the map's anchoring (seed frame) if present else BFS over edge transforms; 'seed' requires an anchored map; 'bfs' always composes edge transforms from the first waypoint")
+    parser.add_argument("--walk-transform", type=float, nargs=16, default=None, metavar="M", help="Row-major 4x4 applied to every waypoint/anchor pose after resolving (residual nudge onto the scene frame)")
+    parser.add_argument("--no-grid", action="store_true", help="Disable the metric ground grid overlay (on by default; also toggleable in the 'Metric grid' GUI panel)")
+    parser.add_argument("--grid-cell-m", type=float, default=1.0, help="Metric grid cell size in meters (adjustable live in the GUI)")
     parser.add_argument("--query-examples", type=Path, default=None, help="Text file with one query per line for the Query panel's Examples dropdown (default: derive examples from the scene's own captioned objects)")
+    parser.add_argument("--odom-topic", default=None, help="Subscribe to this ROS 2 nav_msgs/Odometry topic (e.g. /odometry) and draw the robot's live pose + trail in the scene; each Query press also drops a marker where the robot was")
+    parser.add_argument("--ros-domain-id", type=int, default=None, help="ROS_DOMAIN_ID for the --odom-topic subscription (default: current env)")
+    parser.add_argument("--odom-qos", choices=("reliable", "best_effort"), default="reliable", help="QoS reliability for --odom-topic (Spot's driver often needs best_effort)")
+    parser.add_argument("--odom-trail-seconds", type=float, default=0.0, help="Discard live odometry samples older than this many seconds (0 = keep the whole session)")
+    parser.add_argument(
+        "--world-transform",
+        type=float,
+        nargs=16,
+        default=None,
+        metavar="M",
+        help="Row-major 4x4 T_map_odom applied to every live odometry pose before drawing "
+        "(use the SAME matrix passed to scripts/rgb_bag_frame.py --world-transform, e.g. seed_tform_body)",
+    )
     args = parser.parse_args()
 
     from scene_graph.visualization.viser_visualizer import PipelineViserVisualizer
@@ -196,12 +227,79 @@ def main() -> int:
     if frame_points is None and isinstance(means, torch.Tensor) and means.numel():
         frame_points = means.detach().cpu().numpy().reshape(-1, 3)
     visualizer.set_home_view(frame_points)
+
+    if not args.no_grid:
+        try:
+            visualizer.add_metric_grid(frame_points, cell_m=args.grid_cell_m)
+            print(f"Metric grid: {args.grid_cell_m:g} m cells (toggle in the 'Metric grid' panel)")
+        except Exception as exc:  # noqa: BLE001 - grid is optional context
+            print(f"Skipping metric grid ({exc})")
+
+    if args.walk is not None:
+        try:
+            from scene_graph.visualization.graphnav_walk import load_walk_graph
+
+            walk_transform = None
+            if args.walk_transform is not None:
+                walk_transform = np.asarray(args.walk_transform, dtype=np.float64).reshape(4, 4)
+            nav_graph = load_walk_graph(
+                args.walk.expanduser(),
+                anchor=args.walk_anchor,
+                extra_transform=walk_transform,
+            )
+            visualizer.add_nav_graph(nav_graph)
+            print(
+                f"Nav graph: {len(nav_graph.waypoints)} waypoints, "
+                f"{len(nav_graph.edge_segments())} edges, "
+                f"{len(nav_graph.anchored_objects)} anchored objects "
+                f"(frame={nav_graph.frame}) from {args.walk}"
+            )
+        except Exception as exc:  # noqa: BLE001 - nav graph is optional context
+            print(f"Skipping nav graph ({exc})")
+
+    odom_listener = None
+    if args.odom_topic:
+        world_transform = None
+        if args.world_transform is not None:
+            world_transform = np.asarray(args.world_transform, dtype=np.float64).reshape(4, 4)
+        elif isinstance(state.get("world_transform"), (list, np.ndarray)):
+            world_transform = np.asarray(state["world_transform"], dtype=np.float64).reshape(4, 4)
+            print("Using world_transform stored in the scene state for odometry alignment")
+        try:
+            from odom_ros_listener import OdomRosListener
+
+            odom_listener = OdomRosListener(
+                topic=args.odom_topic,
+                ros_domain_id=args.ros_domain_id,
+                qos=args.odom_qos,
+                world_transform=world_transform,
+                trail_seconds=args.odom_trail_seconds,
+            )
+            odom_listener.start()
+            print(
+                f"Listening to {args.odom_topic} on ROS_DOMAIN_ID="
+                f"{args.ros_domain_id if args.ros_domain_id is not None else '(env)'} — "
+                "robot pose + trail will appear in the scene."
+            )
+        except Exception as exc:  # noqa: BLE001 - odometry is optional context
+            print(f"Could not start odometry listener ({exc}); continuing without it.")
+            odom_listener = None
+
     print(f"Serving on http://localhost:{args.port} — Ctrl+C to stop.")
     try:
         while True:
-            time.sleep(2.0)
+            if odom_listener is not None:
+                stamp, pose = odom_listener.latest()
+                if pose is not None:
+                    visualizer.set_robot_pose(pose, stamp=stamp)
+                time.sleep(0.1)
+            else:
+                time.sleep(2.0)
     except KeyboardInterrupt:
         print("Bye.")
+    finally:
+        if odom_listener is not None:
+            odom_listener.stop()
     return 0
 
 

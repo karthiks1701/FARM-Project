@@ -234,6 +234,27 @@ class PipelineViserVisualizer:
         self._object_voxel_cloud_handle = None
         self._object_voxel_cloud_dim_handle = None
         self._robot_trajectory_handle = None
+        # Nav-graph (Spot GraphNav / Autowalk ``.walk``) overlay.
+        self._nav_graph = None  # scene_graph.visualization.graphnav_walk.NavGraph
+        self._nav_graph_handles: list = []
+        self._nav_graph_visible: bool = True
+        self._nav_graph_labels_visible: bool = True
+        self._nav_graph_axes_length: float = 0.25
+        self._nav_graph_show_checkbox = None
+        self._nav_graph_labels_checkbox = None
+        self._nav_graph_axes_slider = None
+        self._nav_graph_gui_ready: bool = False
+        # Metric ground grid overlay.
+        self._grid_handle = None
+        self._grid_visible: bool = True
+        self._grid_cell_m: float = 1.0
+        self._grid_up_axis: int = 2
+        self._grid_center: np.ndarray | None = None
+        self._grid_ground_level: float = 0.0
+        self._grid_half_extent: float = 10.0
+        self._grid_show_checkbox = None
+        self._grid_cell_slider = None
+        self._grid_gui_ready: bool = False
         self._search_path_handle = None
         self._search_highlight_box_handle = None
         self._search_highlight_edges_handle = None
@@ -268,6 +289,14 @@ class PipelineViserVisualizer:
         self._robot_trajectory_positions: list[np.ndarray] = []
         self._robot_trajectory_max_points: int = 20000
         self._robot_trajectory_min_step_m: float = 1e-3
+        # Live robot pose pushed in from an external source (e.g. ROS /odometry
+        # via scripts/view_scene_state.py). ROS-free: the caller converts the
+        # message and applies any map/seed-frame alignment first.
+        self._robot_pose_frame = None
+        self._live_robot_pose: np.ndarray | None = None
+        self._live_robot_stamp: float | None = None
+        self._query_pose_handles: list = []
+        self._query_pose_count: int = 0
         self._latest_scene_state: dict | None = None
         self._latest_poses: Sequence[torch.Tensor | np.ndarray] = []
         self._hide_unclear_object_boxes = False
@@ -552,6 +581,304 @@ class PipelineViserVisualizer:
             clients = self._server.get_clients()
         for client in clients.values():
             self._try_set_camera(client, position=self._home_camera[0], look_at=self._home_camera[1])
+
+    # ------------------------------------------------------------------
+    # Metric ground grid
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _infer_ground_plane(points: np.ndarray) -> tuple[int, np.ndarray, float, float] | None:
+        """(up_axis, center3, ground_level, half_extent) from an Nx3 cloud.
+
+        Up axis = the AABB's smallest extent (scans are wide, not tall); ground
+        level = the low percentile along it (the floor); half-extent = half the
+        larger horizontal span, clamped so range outliers don't blow up the grid.
+        """
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        pts = pts[np.isfinite(pts).all(axis=1)]
+        if pts.shape[0] < 8:
+            return None
+        mins, maxs = np.percentile(pts, 1.0, axis=0), np.percentile(pts, 99.0, axis=0)
+        extent = maxs - mins
+        up_axis = int(np.argmin(extent))
+        horiz = [i for i in range(3) if i != up_axis]
+        center = (mins + maxs) / 2.0
+        ground_level = float(mins[up_axis])
+        half_extent = float(max(extent[horiz[0]], extent[horiz[1]]) * 0.5 + 2.0)
+        half_extent = float(np.clip(half_extent, 2.0, 80.0))
+        return up_axis, center.astype(np.float64), ground_level, half_extent
+
+    def add_metric_grid(
+        self,
+        points: np.ndarray | None,
+        *,
+        cell_m: float = 1.0,
+        enabled: bool = True,
+    ) -> None:
+        """Overlay a metric ground grid (1 m cells by default) sized to the scene.
+
+        *points* is any Nx3 cloud used to place the plane — the background
+        cloud, object means, or the trajectory. A ``Metric grid`` GUI folder
+        toggles it and adjusts the cell size live.
+        """
+        if not self._enabled or self._server is None:
+            return
+        plane = self._infer_ground_plane(points) if points is not None else None
+        if plane is None:
+            # Fall back to a fixed 20 m grid at the origin so the toggle still works.
+            self._grid_up_axis, self._grid_center = 2, np.zeros(3)
+            self._grid_ground_level, self._grid_half_extent = 0.0, 10.0
+        else:
+            self._grid_up_axis, self._grid_center, self._grid_ground_level, self._grid_half_extent = plane
+        self._grid_cell_m = max(0.05, float(cell_m))
+        self._grid_visible = bool(enabled)
+        self._setup_metric_grid_gui()
+        self._redraw_metric_grid()
+
+    def _setup_metric_grid_gui(self) -> None:
+        if self._grid_gui_ready or self._server is None:
+            return
+        gui = getattr(self._server, "gui", None)
+        if gui is None:
+            return
+        try:
+            with gui.add_folder("Metric grid"):
+                self._grid_show_checkbox = self._gui_add_checkbox(gui, "Show grid", self._grid_visible)
+                self._grid_cell_slider = self._gui_add_slider(
+                    gui, "Cell size (m)", min_v=0.25, max_v=5.0, step=0.25, initial=self._grid_cell_m
+                )
+        except Exception:
+            return
+        self._grid_gui_ready = True
+        for handle in (self._grid_show_checkbox, self._grid_cell_slider):
+            on_update = getattr(handle, "on_update", None)
+            if callable(on_update):
+                with contextlib.suppress(Exception):
+
+                    @on_update
+                    def _(_event=None):
+                        self._handle_grid_gui_changed()
+
+    def _handle_grid_gui_changed(self) -> None:
+        with contextlib.suppress(Exception):
+            if self._grid_show_checkbox is not None:
+                self._grid_visible = bool(self._grid_show_checkbox.value)
+        with contextlib.suppress(Exception):
+            if self._grid_cell_slider is not None:
+                self._grid_cell_m = max(0.05, float(self._grid_cell_slider.value))
+        self._redraw_metric_grid()
+
+    def _redraw_metric_grid(self) -> None:
+        if self._server is None:
+            return
+        if self._grid_handle is not None:
+            with contextlib.suppress(Exception):
+                self._grid_handle.remove()
+            self._grid_handle = None
+        if not self._grid_visible or self._grid_center is None:
+            return
+        up = self._grid_up_axis
+        horiz = [i for i in range(3) if i != up]
+        cell = max(0.05, float(self._grid_cell_m))
+        # Snap the half-extent to a whole number of cells so lines meet the edge.
+        side = 2.0 * float(self._grid_half_extent)
+        side = max(cell * 2.0, round(side / cell) * cell)
+        segments = int(np.clip(round(side / cell), 2, 400))
+        position = np.zeros(3, dtype=np.float32)
+        position[horiz[0]] = float(self._grid_center[horiz[0]])
+        position[horiz[1]] = float(self._grid_center[horiz[1]])
+        position[up] = float(self._grid_ground_level)
+        plane = {0: "yz", 1: "xz", 2: "xy"}[up]
+        pos_t = tuple(float(v) for v in position)
+        section = max(cell, cell * 5.0)
+        # viser's ``add_grid`` signature has drifted across versions: try the
+        # richest form, then progressively simpler ones.
+        attempts = (
+            dict(plane=plane, width=side, height=side, position=pos_t,
+                 cell_size=cell, section_size=section),
+            dict(plane=plane, width=side, height=side, position=pos_t,
+                 width_segments=segments, height_segments=segments),
+            dict(width=side, height=side, position=pos_t, cell_size=cell, section_size=section),
+            dict(width=side, height=side, position=pos_t),
+        )
+        for kwargs in attempts:
+            try:
+                self._grid_handle = self._server.scene.add_grid("/metric_grid", **kwargs)
+                break
+            except TypeError:
+                continue
+            except Exception:
+                break
+        with contextlib.suppress(Exception):
+            self._server.flush()
+
+    # ------------------------------------------------------------------
+    # Nav graph (Spot GraphNav / Autowalk ``.walk``) overlay
+    # ------------------------------------------------------------------
+    def add_nav_graph(
+        self,
+        nav_graph,
+        *,
+        axes_length: float = 0.25,
+        show_labels: bool = True,
+        visible: bool = True,
+    ) -> None:
+        """Overlay a Spot ``.walk`` nav graph: one coordinate frame per waypoint
+        pose, connecting edges, waypoint-name labels, and any anchored fiducials.
+
+        *nav_graph* is a
+        :class:`scene_graph.visualization.graphnav_walk.NavGraph`. A ``Nav graph``
+        GUI folder toggles the overlay and the labels.
+        """
+        if not self._enabled or self._server is None or nav_graph is None:
+            return
+        self._nav_graph = nav_graph
+        self._nav_graph_axes_length = max(0.02, float(axes_length))
+        self._nav_graph_labels_visible = bool(show_labels)
+        self._nav_graph_visible = bool(visible)
+        self._setup_nav_graph_gui()
+        self._redraw_nav_graph()
+
+    def _setup_nav_graph_gui(self) -> None:
+        if self._nav_graph_gui_ready or self._server is None:
+            return
+        gui = getattr(self._server, "gui", None)
+        if gui is None:
+            return
+        try:
+            with gui.add_folder("Nav graph"):
+                self._nav_graph_show_checkbox = self._gui_add_checkbox(
+                    gui, "Show nav graph", self._nav_graph_visible
+                )
+                self._nav_graph_labels_checkbox = self._gui_add_checkbox(
+                    gui, "Waypoint labels", self._nav_graph_labels_visible
+                )
+                self._nav_graph_axes_slider = self._gui_add_slider(
+                    gui, "Waypoint axes (m)", min_v=0.05, max_v=1.0, step=0.05,
+                    initial=self._nav_graph_axes_length,
+                )
+        except Exception:
+            return
+        self._nav_graph_gui_ready = True
+        for handle in (
+            self._nav_graph_show_checkbox,
+            self._nav_graph_labels_checkbox,
+            self._nav_graph_axes_slider,
+        ):
+            on_update = getattr(handle, "on_update", None)
+            if callable(on_update):
+                with contextlib.suppress(Exception):
+
+                    @on_update
+                    def _(_event=None):
+                        self._handle_nav_graph_gui_changed()
+
+    def _handle_nav_graph_gui_changed(self) -> None:
+        with contextlib.suppress(Exception):
+            if self._nav_graph_show_checkbox is not None:
+                self._nav_graph_visible = bool(self._nav_graph_show_checkbox.value)
+        with contextlib.suppress(Exception):
+            if self._nav_graph_labels_checkbox is not None:
+                self._nav_graph_labels_visible = bool(self._nav_graph_labels_checkbox.value)
+        with contextlib.suppress(Exception):
+            if self._nav_graph_axes_slider is not None:
+                self._nav_graph_axes_length = max(0.02, float(self._nav_graph_axes_slider.value))
+        self._redraw_nav_graph()
+
+    _NAV_GRAPH_LABEL_CAP = 250
+
+    def _redraw_nav_graph(self) -> None:
+        if self._server is None:
+            return
+        for handle in self._nav_graph_handles:
+            with contextlib.suppress(Exception):
+                handle.remove()
+        self._nav_graph_handles = []
+        nav = self._nav_graph
+        if nav is None or not self._nav_graph_visible:
+            return
+
+        positions = nav.waypoint_positions()
+        if positions.shape[0] == 0:
+            return
+        wxyzs = nav.waypoint_wxyz()
+        axes_len = float(self._nav_graph_axes_length)
+
+        with contextlib.suppress(Exception):
+            with self._server.atomic():
+                # Waypoint orientation frames.
+                with contextlib.suppress(Exception):
+                    self._nav_graph_handles.append(
+                        self._server.scene.add_batched_axes(
+                            "/nav_graph/waypoints",
+                            batched_wxyzs=wxyzs,
+                            batched_positions=positions,
+                            axes_length=axes_len,
+                            axes_radius=max(0.004, axes_len * 0.04),
+                        )
+                    )
+                # Waypoint dots (always visible even when zoomed out).
+                with contextlib.suppress(Exception):
+                    self._nav_graph_handles.append(
+                        self._server.scene.add_point_cloud(
+                            "/nav_graph/waypoint_dots",
+                            points=positions,
+                            colors=np.tile(np.array([255, 190, 40], np.uint8), (positions.shape[0], 1)),
+                            point_size=max(0.03, axes_len * 0.5),
+                            point_shape="circle",
+                        )
+                    )
+                # Edges.
+                segs = nav.edge_segments()
+                if segs.shape[0] > 0:
+                    colors = np.tile(np.array([80, 180, 255], np.uint8), (segs.shape[0], 2, 1))
+                    with contextlib.suppress(Exception):
+                        self._nav_graph_handles.append(
+                            self._server.scene.add_line_segments(
+                                "/nav_graph/edges", points=segs, colors=colors, line_width=3.0
+                            )
+                        )
+                # Anchored world objects (fiducials).
+                anchor_pos = nav.anchored_object_positions()
+                if anchor_pos.shape[0] > 0:
+                    anchor_wxyz = np.tile(np.array([1.0, 0.0, 0.0, 0.0], np.float32), (anchor_pos.shape[0], 1))
+                    with contextlib.suppress(Exception):
+                        self._nav_graph_handles.append(
+                            self._server.scene.add_batched_axes(
+                                "/nav_graph/anchors",
+                                batched_wxyzs=anchor_wxyz,
+                                batched_positions=anchor_pos,
+                                axes_length=max(0.3, axes_len * 2.0),
+                                axes_radius=max(0.008, axes_len * 0.08),
+                            )
+                        )
+                    for i, obj in enumerate(nav.anchored_objects):
+                        p = obj.T_world[:3, 3]
+                        with contextlib.suppress(Exception):
+                            self._nav_graph_handles.append(
+                                self._server.scene.add_label(
+                                    f"/nav_graph/anchor_labels/{i}",
+                                    text=f"⚑ {obj.id}"[:48],
+                                    position=(float(p[0]), float(p[1]), float(p[2])),
+                                )
+                            )
+                # Waypoint-name labels (capped — big graphs would flood the scene).
+                if self._nav_graph_labels_visible:
+                    names = nav.waypoint_names()
+                    n = positions.shape[0]
+                    step = max(1, int(np.ceil(n / self._NAV_GRAPH_LABEL_CAP)))
+                    up = self._grid_up_axis
+                    for i in range(0, n, step):
+                        p = positions[i].astype(float)
+                        p[up] += axes_len * 0.6
+                        with contextlib.suppress(Exception):
+                            self._nav_graph_handles.append(
+                                self._server.scene.add_label(
+                                    f"/nav_graph/labels/{i}",
+                                    text=str(names[i])[:40],
+                                    position=(float(p[0]), float(p[1]), float(p[2])),
+                                )
+                            )
+            self._server.flush()
 
     def set_view_depth_clip(
         self,
@@ -916,6 +1243,20 @@ class PipelineViserVisualizer:
         return None
 
     @staticmethod
+    def _gui_add_checkbox(gui_obj, label: str, initial: bool):
+        fn = getattr(gui_obj, "add_checkbox", None)
+        if fn is None:
+            return None
+        try:
+            return fn(label, initial_value=bool(initial))
+        except TypeError:
+            with contextlib.suppress(Exception):
+                return fn(label, bool(initial))
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
     def _gui_set_markdown(handle: object | None, text: str) -> None:
         if handle is None:
             return
@@ -1260,8 +1601,11 @@ class PipelineViserVisualizer:
     def _run_relational_query(self, query: str):
         """Run the eval/paper relational pipeline: parse_query -> execute_spatial_query.
 
-        Returns ``(results, method, query_graph)`` where results is a list of
-        ``(object_id, composite_score, caption)`` ranked best-first.
+        Returns ``(results, method, query_graph, focus_ids, roles)`` where
+        ``results`` is a list of ``(object_id, composite_score, caption, pos,
+        nav)`` ranked best-first — ``pos`` is the object centre and ``nav`` is a
+        :class:`~scene_graph.retrieval.navigation_pose.NavigationPose` (or None)
+        with a collision-aware robot goal.
         """
         from scene_graph.retrieval.spatial_reasoning import execute_spatial_query, parse_query
         from scene_graph.retrieval.spatial_reasoning.models import Predicate, QueryGraph
@@ -1313,6 +1657,24 @@ class PipelineViserVisualizer:
         with contextlib.suppress(Exception):
             means_np = _to_numpy(state.get("means")).astype(np.float32, copy=False)
 
+        # Collision-aware navigation pose per match: the object centroid is
+        # inside the object, so it is never a safe robot goal. `navigation_pose`
+        # returns a nearby standoff pose clear of every OTHER object's voxels by
+        # >= robot_radius + safety barrier (env: FARM_NAV_*). Advisory — failures
+        # never block the query.
+        nav_by_index: dict = {}
+        with contextlib.suppress(Exception):
+            from scene_graph.retrieval.navigation_pose import navigation_poses_for_scene
+
+            nav_by_index = navigation_poses_for_scene(
+                state,
+                [int(c.object_index) for c in scored[:12]],
+                clearance_margin_m=float(os.getenv("FARM_NAV_CLEARANCE_M", "0.10")),
+                robot_radius_m=float(os.getenv("FARM_NAV_ROBOT_RADIUS_M", "0.5")),
+                search_radius_m=float(os.getenv("FARM_NAV_SEARCH_RADIUS_M", "2.5")),
+                up_axis=int(os.getenv("FARM_NAV_UP_AXIS", "2")),
+            )
+
         # `results` and the map's focus set are built from the exact same
         # `scored` list, so the "Top matches" text and the boxes shown on the
         # map always agree on both count and identity — no separate top-5 cap
@@ -1326,7 +1688,7 @@ class PipelineViserVisualizer:
             pos = None
             if means_np is not None and means_np.ndim == 2 and 0 <= oi < means_np.shape[0]:
                 pos = tuple(float(v) for v in means_np[oi])
-            results.append((int(cand.object_id), float(cand.composite_score), cap, pos))
+            results.append((int(cand.object_id), float(cand.composite_score), cap, pos, nav_by_index.get(oi)))
 
         # Focus set = exactly the scored result objects. Anchors (objects the
         # spatial predicates reference, e.g. the "table" in "mug on the
@@ -1375,7 +1737,7 @@ class PipelineViserVisualizer:
                     dropped.append(f"{r.name}: {str(r.drop_reason).replace('_', ' ')}")
         roles = {
             "target": target_id,
-            "top_k": {oid for oid, _score, _cap, _pos in results},
+            "top_k": {oid for oid, _score, _cap, _pos, _nav in results},
             "anchors": anchor_ids - target_set,
             "distractors": candidate_ids - anchor_ids - target_set,
             "edges": sorted(edge_anchor_ids - target_set),
@@ -1465,11 +1827,19 @@ class PipelineViserVisualizer:
         for note in (roles or {}).get("dropped", [])[:3]:
             lines.append(f"· ⚠ _{note} — constraint not applied_")
         lines.append("")
-        lines.append("**Top matches:**")
-        for rank, (obj_id, score, caption, pos) in enumerate(results, start=1):
+        lines.append("**Top matches:** _(pos = object centre; nav = collision-aware robot goal)_")
+        for rank, (obj_id, score, caption, pos, nav) in enumerate(results, start=1):
             cap = (caption or "(no caption)").strip()
             pos_str = f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})" if pos is not None else "(no position)"
-            lines.append(f"{rank}. `#{obj_id}` ({score:.3f}) — {pos_str} — {cap}")
+            lines.append(f"{rank}. `#{obj_id}` ({score:.3f}) — pos {pos_str} — {cap}")
+            if nav is not None:
+                nx, ny, nz = nav.position
+                flag = "✅" if nav.navigable else "⚠️ no body-safe pose"
+                lines.append(
+                    f"    ↳ nav ({nx:.2f}, {ny:.2f}, {nz:.2f}) yaw {math.degrees(nav.yaw_rad):.0f}° · "
+                    f"clearance {nav.clearance_m:.2f} m / {nav.required_clearance_m:.2f} m required · "
+                    f"offset {nav.offset_from_target_m:.2f} m · {flag}"
+                )
         lines.append("")
         lines.append("_Others hidden — click **Reset view** to restore._")
         self._gui_set_markdown(self._query_results_display, "\n\n".join(lines))
@@ -1479,6 +1849,11 @@ class PipelineViserVisualizer:
         self._query_roles = roles
         self._apply_focus(focus_ids)
         self._jump_to_object_id(results[0][0])
+
+        # Record where the robot was (live ROS /odometry) when this query ran.
+        if self._live_robot_pose is not None:
+            with contextlib.suppress(Exception):
+                self.mark_query_pose(query, self._live_robot_pose)
 
     def _apply_focus(self, focus_ids: set[int] | None) -> None:
         """Hide all objects except *focus_ids* (None restores everything)."""
@@ -1502,6 +1877,11 @@ class PipelineViserVisualizer:
                 with contextlib.suppress(Exception):
                     handle.remove()
                 setattr(self, attr, None)
+        # Remove per-query robot-pose markers.
+        for handle in self._query_pose_handles:
+            with contextlib.suppress(Exception):
+                handle.remove()
+        self._query_pose_handles = []
         if self._server is not None and self._latest_scene_state is not None:
             with contextlib.suppress(Exception):
                 with self._server.atomic():
@@ -2271,9 +2651,20 @@ class PipelineViserVisualizer:
     def _update_robot_trajectory(self, poses: Sequence[torch.Tensor | np.ndarray], scene_state: dict) -> None:
         if self._server is None:
             return
-
         position = self._get_robot_position(poses, scene_state)
         if position is None:
+            return
+        self._append_robot_trajectory_point(position)
+
+    def _append_robot_trajectory_point(self, position: np.ndarray) -> None:
+        """Append one XYZ sample to the robot trail (min-step dedup + max-length
+        cap) and redraw ``/robot_trajectory``. Shared by the batch-driven path
+        and the live :meth:`set_robot_pose` path."""
+        try:
+            position = np.asarray(position, dtype=np.float32).reshape(3)
+        except Exception:
+            return
+        if not np.all(np.isfinite(position)):
             return
 
         if self._robot_trajectory_positions:
@@ -2287,9 +2678,11 @@ class PipelineViserVisualizer:
             if overflow > 0:
                 self._robot_trajectory_positions = self._robot_trajectory_positions[overflow:]
 
-        if len(self._robot_trajectory_positions) < 2:
-            return
+        self._redraw_robot_trajectory()
 
+    def _redraw_robot_trajectory(self) -> None:
+        if self._server is None or len(self._robot_trajectory_positions) < 2:
+            return
         positions = np.stack(self._robot_trajectory_positions, axis=0).astype(np.float32, copy=False)
         segments = np.stack([positions[:-1], positions[1:]], axis=1)
         colors = np.tile(np.array([255, 0, 0], dtype=np.uint8), (segments.shape[0], 2, 1))
@@ -2304,6 +2697,86 @@ class PipelineViserVisualizer:
             colors=colors,
             line_width=4.0,
         )
+
+    def set_robot_pose(self, T_world_robot: np.ndarray, *, stamp: float | None = None) -> None:
+        """Push an externally-sourced robot pose (e.g. live ROS ``/odometry``)
+        into the scene: moves a ``/robot_pose`` coordinate frame and extends the
+        ``/robot_trajectory`` trail.
+
+        ``T_world_robot`` is a 4x4 body-to-world transform **already expressed in
+        the map frame** -- apply any world/seed-frame alignment before calling.
+        This method stays ROS-free; the caller converts the message.
+        """
+        if not self._enabled or self._server is None:
+            return
+        try:
+            T = np.asarray(T_world_robot, dtype=np.float32)
+        except Exception:
+            return
+        if T.shape != (4, 4) or not np.all(np.isfinite(T)):
+            return
+
+        self._live_robot_pose = T
+        self._live_robot_stamp = stamp
+
+        with contextlib.suppress(Exception):
+            with self._server.atomic():
+                if self._robot_pose_frame is None:
+                    self._robot_pose_frame = self._server.scene.add_frame(
+                        name="/robot_pose", axes_length=0.3, axes_radius=0.012
+                    )
+                rotation, translation = T[:3, :3], T[:3, 3]
+                if SO3 is not None and hasattr(self._robot_pose_frame, "wxyz"):
+                    self._robot_pose_frame.wxyz = SO3.from_matrix(rotation).wxyz
+                if hasattr(self._robot_pose_frame, "position"):
+                    self._robot_pose_frame.position = translation
+                self._append_robot_trajectory_point(translation)
+            self._server.flush()
+
+    def mark_query_pose(self, label: str, T_world_robot: np.ndarray | None = None) -> None:
+        """Drop a persistent marker at the robot's position for a query event, so
+        you can see where the robot was when the query ran. Markers are cleared
+        by *Reset view*. Falls back to the last :meth:`set_robot_pose`."""
+        if not self._enabled or self._server is None:
+            return
+        pose = T_world_robot if T_world_robot is not None else self._live_robot_pose
+        if pose is None:
+            return
+        try:
+            arr = np.asarray(pose, dtype=np.float32)
+        except Exception:
+            return
+        if arr.shape == (4, 4):
+            position = arr[:3, 3]
+        elif arr.shape == (3,):
+            position = arr
+        else:
+            return
+        if not np.all(np.isfinite(position)):
+            return
+
+        self._query_pose_count += 1
+        n = self._query_pose_count
+        pos_t = tuple(float(v) for v in position)
+        with contextlib.suppress(Exception):
+            with self._server.atomic():
+                handle = self._server.scene.add_icosphere(
+                    name=f"/query_robot_pose/{n}",
+                    radius=0.12,
+                    subdivisions=2,
+                    position=pos_t,
+                    color=(90, 200, 255),
+                    opacity=0.9,
+                )
+                self._query_pose_handles.append(handle)
+                with contextlib.suppress(Exception):
+                    label_handle = self._server.scene.add_label(
+                        name=f"/query_robot_pose/{n}_label",
+                        text=(label or "query")[:60],
+                        position=(pos_t[0], pos_t[1], pos_t[2] + 0.25),
+                    )
+                    self._query_pose_handles.append(label_handle)
+            self._server.flush()
 
     @staticmethod
     def _row_value(rows: object, idx: int, default: object = None) -> object:

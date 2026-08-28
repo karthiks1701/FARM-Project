@@ -73,7 +73,7 @@ RUN /usr/local/bin/uv pip install \
         opencv-python h5py huggingface_hub \
         loguru numpy Pillow PyYAML requests \
         "networkx>=2.8" supervision tqdm timm \
-        scikit-learn scipy transforms3d \
+        scikit-learn scipy transforms3d bosdyn-api \
         "imageio[ffmpeg]" matplotlib pydantic viser \
         "vllm>=0.20.0" accelerate safetensors \
         "qwen-vl-utils>=0.0.14" \

@@ -48,6 +48,9 @@ vllm = [
     "qwen-vl-utils>=0.0.14",
 ]
 dev = ["pytest", "black", "flake8"]
+# Spot GraphNav / Autowalk ``.walk`` map parsing for the viser nav-graph overlay
+# (scripts/view_scene_state.py --walk). Protobuf definitions only — no robot.
+walk = ["bosdyn-api"]
 
 [build-system]
 requires = ["setuptools>=45", "wheel"]

@@ -13,6 +13,14 @@ Run inside the docker container, with an embedding server reachable
 
 Set ``QWEN3_VL_EMBED_ENABLED=0`` to skip the VL-embedding path if only the
 text embed server is up.
+
+For each relational match the CLI also prints a **collision-aware navigation
+pose**: the object centroid is inside the object and unsafe as a robot goal, so
+``scene_graph.retrieval.navigation_pose`` derives a nearby standoff pose clear of
+every other object's voxel evidence by at least ``--robot-radius-m`` +
+``--clearance-m`` (Spot ~0.5 m footprint + a few-cm safety barrier). Matches with
+no body-safe pose within ``--nav-search-radius-m`` are flagged ``[UNSAFE]``
+rather than silently returned.
 """
 
 from __future__ import annotations
@@ -35,6 +43,16 @@ def main() -> int:
                         help="Relational engine (joint_v1 default; unified_soft_w50 = the paper's locked protocol).")
     parser.add_argument("--embedding-only", action="store_true",
                         help="Skip the LLM parse + relational scoring; embedding cluster retrieval only.")
+    parser.add_argument("--no-nav-pose", action="store_true",
+                        help="Don't compute a collision-aware navigation pose for each match (relational path only).")
+    parser.add_argument("--clearance-m", type=float, default=0.10,
+                        help="Safety barrier (metres) kept between the robot footprint and any other object's voxels.")
+    parser.add_argument("--robot-radius-m", type=float, default=0.5,
+                        help="Robot footprint half-width (metres); the nav pose keeps robot_radius + clearance from obstacles.")
+    parser.add_argument("--nav-search-radius-m", type=float, default=2.5,
+                        help="How far out from the object to search for a body-safe standoff pose.")
+    parser.add_argument("--nav-up-axis", type=int, default=2, choices=(0, 1, 2),
+                        help="World vertical axis (Spot/GraphNav seed frame is Z-up = 2).")
     args = parser.parse_args()
 
     pt_path = Path(args.pt)
@@ -77,6 +95,23 @@ def main() -> int:
             dt = time.time() - t0
             preds = ", ".join(f"{p.name}({', '.join(map(str, p.args))})" for p in query_graph.predicates)
             print(f"\nquery={args.query!r} [{args.spatial_method}] -> parsed [{preds}] in {dt:.2f}s\n")
+
+            nav_poses = {}
+            if not args.no_nav_pose:
+                try:
+                    from scene_graph.retrieval.navigation_pose import navigation_poses_for_scene
+
+                    nav_poses = navigation_poses_for_scene(
+                        state,
+                        [c.object_index for c in scored[: args.top_k]],
+                        clearance_margin_m=float(args.clearance_m),
+                        robot_radius_m=float(args.robot_radius_m),
+                        search_radius_m=float(args.nav_search_radius_m),
+                        up_axis=int(args.nav_up_axis),
+                    )
+                except Exception as exc:  # noqa: BLE001 - nav pose is advisory
+                    print(f"(navigation-pose computation skipped: {exc})\n")
+
             for rank, cand in enumerate(scored[: args.top_k], start=1):
                 cap = str(captions[cand.object_index] if cand.object_index < len(captions) else "") or "(no caption)"
                 cap = (cap[:70] + "…") if len(cap) > 70 else cap
@@ -87,6 +122,9 @@ def main() -> int:
                     x, y, z = (float(v) for v in means[cand.object_index])
                     pos_str = f"pos=({x:.2f}, {y:.2f}, {z:.2f})"
                 print(f"  #{rank} object_id={cand.object_id} score={cand.composite_score:.3f} {pos_str}{extra} {cap!r}")
+                nav = nav_poses.get(cand.object_index)
+                if nav is not None:
+                    print(f"       {nav.summary()}  — {nav.note}")
             return 0
         except Exception as exc:  # noqa: BLE001 - degrade to embedding retrieval
             print(f"Relational path unavailable ({exc}); falling back to embedding retrieval.")
