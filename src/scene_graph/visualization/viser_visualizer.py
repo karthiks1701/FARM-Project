@@ -297,6 +297,12 @@ class PipelineViserVisualizer:
         self._live_robot_stamp: float | None = None
         self._query_pose_handles: list = []
         self._query_pose_count: int = 0
+        # Collision-aware navigation-pose markers drawn in the 3D scene after a
+        # query (footprint ring + heading + connector to the object centre).
+        self._nav_pose_handles: list = []
+        self._nav_pose_show: bool = True
+        self._nav_pose_show_checkbox = None
+        self._last_query_results: list | None = None
         self._latest_scene_state: dict | None = None
         self._latest_poses: Sequence[torch.Tensor | np.ndarray] = []
         self._hide_unclear_object_boxes = False
@@ -1143,6 +1149,39 @@ class PipelineViserVisualizer:
                 elif hasattr(caption, "value"):
                     caption.value = text
 
+    def set_live_rgb(self, image, *, caption: str | None = None) -> None:
+        """Push an externally-sourced RGB frame into the 'Live RGB' GUI panel.
+
+        For streamed sources (e.g. a ROS ``/camera/.../image_raw`` topic bridged
+        over WebSocket by ``scripts/ros_ws_client.py``). *image* is HxWx3
+        (uint8 0..255 or float 0..1). No-op if the panel is disabled. Honors the
+        ``live_rgb_max_fps`` throttle.
+        """
+        if not self._enabled or not self._live_rgb_enabled or self._live_rgb_display is None:
+            return
+        now = time.monotonic()
+        if self._live_rgb_max_fps > 0.0 and (now - self._last_live_rgb_update_s) < (1.0 / self._live_rgb_max_fps):
+            return
+        prepared = self._prepare_live_rgb(image)
+        if prepared is None:
+            return
+        self._last_live_rgb_update_s = now
+        display = self._live_rgb_display
+        with contextlib.suppress(Exception):
+            if hasattr(display, "image"):
+                display.image = prepared
+            elif hasattr(display, "value"):
+                display.value = prepared
+        cap = self._live_rgb_caption
+        if cap is not None:
+            h, w = prepared.shape[:2]
+            text = caption or f"Live camera: {w}x{h}"
+            with contextlib.suppress(Exception):
+                if hasattr(cap, "content"):
+                    cap.content = text
+                elif hasattr(cap, "value"):
+                    cap.value = text
+
     def _prepare_live_rgb(self, color: torch.Tensor | np.ndarray | object) -> np.ndarray | None:
         try:
             arr = _to_numpy(color)
@@ -1291,6 +1330,9 @@ class PipelineViserVisualizer:
                 self._query_input = self._gui_add_text(gui, "Query", initial="")
                 self._query_search_button = self._gui_add_button(gui, "Search")
                 self._reset_button = self._gui_add_button(gui, "Reset view")
+                self._nav_pose_show_checkbox = self._gui_add_checkbox(
+                    gui, "Show navigation poses", self._nav_pose_show
+                )
                 self._query_results_display = gui.add_markdown("")
         except Exception:
             return
@@ -1343,6 +1385,21 @@ class PipelineViserVisualizer:
                     @on_click
                     def _(_event=None):
                         self._reset_view()
+
+        nav_cb = self._nav_pose_show_checkbox
+        if nav_cb is not None:
+            on_update = getattr(nav_cb, "on_update", None)
+            if callable(on_update):
+                with contextlib.suppress(Exception):
+
+                    @on_update
+                    def _(_event=None):
+                        with contextlib.suppress(Exception):
+                            self._nav_pose_show = bool(nav_cb.value)
+                        if self._nav_pose_show:
+                            self._draw_navigation_poses(self._last_query_results)
+                        else:
+                            self._clear_navigation_poses()
 
     _QUERY_EXAMPLE_SKIP_CATEGORIES = frozenset(
         {"person", "warehouse", "building", "wall", "floor", "ceiling", "room", "ground", "sky"}
@@ -1850,6 +1907,13 @@ class PipelineViserVisualizer:
         self._apply_focus(focus_ids)
         self._jump_to_object_id(results[0][0])
 
+        # Draw the collision-aware navigation pose for every match in the 3D
+        # scene: a footprint ring + heading arrow + a connector to the object
+        # centre (green = body-safe, red = no safe pose found).
+        self._last_query_results = results
+        if self._nav_pose_show:
+            self._draw_navigation_poses(results)
+
         # Record where the robot was (live ROS /odometry) when this query ran.
         if self._live_robot_pose is not None:
             with contextlib.suppress(Exception):
@@ -1882,6 +1946,9 @@ class PipelineViserVisualizer:
             with contextlib.suppress(Exception):
                 handle.remove()
         self._query_pose_handles = []
+        # Remove the navigation-pose markers.
+        self._clear_navigation_poses()
+        self._last_query_results = None
         if self._server is not None and self._latest_scene_state is not None:
             with contextlib.suppress(Exception):
                 with self._server.atomic():
@@ -1895,6 +1962,114 @@ class PipelineViserVisualizer:
             for client in clients.values():
                 self._try_set_camera(client, position=home[0], look_at=home[1])
         self._gui_set_markdown(self._query_results_display, "_View reset._")
+
+    # ------------------------------------------------------------------
+    # Navigation-pose markers (drawn in the 3D scene on query)
+    # ------------------------------------------------------------------
+    def _clear_navigation_poses(self) -> None:
+        for handle in self._nav_pose_handles:
+            with contextlib.suppress(Exception):
+                handle.remove()
+        self._nav_pose_handles = []
+        with contextlib.suppress(Exception):
+            if self._server is not None:
+                self._server.flush()
+
+    @staticmethod
+    def _horiz_ring_segments(center: np.ndarray, radius: float, up: int, n: int = 48) -> np.ndarray:
+        horiz = [a for a in range(3) if a != up]
+        ang = np.linspace(0.0, 2.0 * np.pi, int(max(6, n)), endpoint=False)
+        pts = np.tile(np.asarray(center, dtype=np.float32).reshape(3), (ang.shape[0], 1))
+        pts[:, horiz[0]] += float(radius) * np.cos(ang).astype(np.float32)
+        pts[:, horiz[1]] += float(radius) * np.sin(ang).astype(np.float32)
+        return np.stack([pts, np.roll(pts, -1, axis=0)], axis=1)
+
+    def _draw_navigation_poses(self, results: list | None, *, max_markers: int = 10) -> None:
+        """Draw one navigation-pose marker per query match: a robot-footprint
+        ring + heading arrow at the standoff pose, plus a thin link to the
+        object centre. Green = body-safe, red = no safe pose was found."""
+        self._clear_navigation_poses()
+        if self._server is None or not self._nav_pose_show or not results:
+            return
+        up = int(os.getenv("FARM_NAV_UP_AXIS", "2")) % 3
+        horiz = [a for a in range(3) if a != up]
+        appended = 0
+        with contextlib.suppress(Exception):
+            with self._server.atomic():
+                for entry in results[:max_markers]:
+                    try:
+                        obj_id, _score, _caption, pos, nav = entry
+                    except Exception:
+                        continue
+                    if nav is None:
+                        continue
+                    p = np.asarray(nav.position, dtype=np.float32).reshape(3)
+                    if not np.all(np.isfinite(p)):
+                        continue
+                    radius = float(getattr(nav, "robot_radius_m", 0.5)) or 0.5
+                    ok = bool(getattr(nav, "navigable", False))
+                    color = (60, 200, 100) if ok else (235, 90, 60)
+                    base = f"/nav_pose/{int(obj_id)}"
+
+                    ring = self._horiz_ring_segments(p, radius, up)
+                    self._nav_pose_handles.append(
+                        self._server.scene.add_line_segments(
+                            f"{base}/footprint",
+                            points=ring,
+                            colors=np.tile(np.array(color, np.uint8), (ring.shape[0], 2, 1)),
+                            line_width=3.0,
+                        )
+                    )
+
+                    heading = p.copy()
+                    heading[horiz[0]] += radius * 1.5 * float(np.cos(nav.yaw_rad))
+                    heading[horiz[1]] += radius * 1.5 * float(np.sin(nav.yaw_rad))
+                    self._nav_pose_handles.append(
+                        self._server.scene.add_line_segments(
+                            f"{base}/heading",
+                            points=np.stack([p, heading], axis=0)[None, ...],
+                            colors=np.tile(np.array(color, np.uint8), (1, 2, 1)),
+                            line_width=5.0,
+                        )
+                    )
+
+                    if pos is not None:
+                        obj_c = np.asarray(pos, dtype=np.float32).reshape(3)
+                        if np.all(np.isfinite(obj_c)):
+                            self._nav_pose_handles.append(
+                                self._server.scene.add_line_segments(
+                                    f"{base}/link",
+                                    points=np.stack([p, obj_c], axis=0)[None, ...],
+                                    colors=np.full((1, 2, 3), 180, np.uint8),
+                                    line_width=1.5,
+                                )
+                            )
+
+                    with contextlib.suppress(Exception):
+                        self._nav_pose_handles.append(
+                            self._server.scene.add_icosphere(
+                                f"{base}/dot", radius=max(0.05, radius * 0.12),
+                                subdivisions=2,
+                                position=(float(p[0]), float(p[1]), float(p[2])),
+                                color=color, opacity=0.95,
+                            )
+                        )
+                    with contextlib.suppress(Exception):
+                        lp = p.copy()
+                        lp[up] += 0.2
+                        txt = (
+                            f"#{int(obj_id)} nav {nav.clearance_m:.2f}m"
+                            if ok else f"#{int(obj_id)} ⚠ no safe pose ({nav.clearance_m:.2f}m)"
+                        )
+                        self._nav_pose_handles.append(
+                            self._server.scene.add_label(
+                                f"{base}/label", text=txt,
+                                position=(float(lp[0]), float(lp[1]), float(lp[2])),
+                            )
+                        )
+                    appended += 1
+            self._server.flush()
+        LOGGER.info("Drew %d navigation-pose marker(s)", appended)
 
     def _jump_to_object_id(self, target_id: int) -> None:
         """Highlight object *target_id* and fly the camera to it."""

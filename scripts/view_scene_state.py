@@ -24,6 +24,11 @@ Examples (inside the container)::
     python scripts/view_scene_state.py --pt /data/out/site.pt \
         --walk /data/walks/site.walk --grid-cell-m 1.0
 
+``--ws-url ws://<robot-host>:8765`` streams a remote robot's ``/odometry``
+(live ``/robot_pose`` frame + trail) and color image (**Live RGB** panel) from a
+``scripts/ros_ws_bridge.py`` running on that host — no ROS on this machine.
+``--world-transform`` aligns the odometry exactly as for ``--odom-topic``.
+
 A metric ground grid is drawn by default (``--no-grid`` to suppress, or toggle
 it in the **Metric grid** GUI panel). ``--walk`` overlays a Boston Dynamics
 GraphNav / Autowalk ``.walk`` map: one coordinate frame per waypoint pose,
@@ -143,6 +148,8 @@ def main() -> int:
     parser.add_argument("--no-grid", action="store_true", help="Disable the metric ground grid overlay (on by default; also toggleable in the 'Metric grid' GUI panel)")
     parser.add_argument("--grid-cell-m", type=float, default=1.0, help="Metric grid cell size in meters (adjustable live in the GUI)")
     parser.add_argument("--query-examples", type=Path, default=None, help="Text file with one query per line for the Query panel's Examples dropdown (default: derive examples from the scene's own captioned objects)")
+    parser.add_argument("--ws-url", default=None, help="WebSocket URL of a scripts/ros_ws_bridge.py running on the robot host (e.g. ws://192.168.1.192:8765). Streams /odometry (robot pose + trail) and the color image (Live RGB panel) without ROS on this machine. --world-transform aligns the odometry like --odom-topic.")
+    parser.add_argument("--ws-no-image", action="store_true", help="With --ws-url, ignore the streamed camera image (odometry only)")
     parser.add_argument("--odom-topic", default=None, help="Subscribe to this ROS 2 nav_msgs/Odometry topic (e.g. /odometry) and draw the robot's live pose + trail in the scene; each Query press also drops a marker where the robot was")
     parser.add_argument("--ros-domain-id", type=int, default=None, help="ROS_DOMAIN_ID for the --odom-topic subscription (default: current env)")
     parser.add_argument("--odom-qos", choices=("reliable", "best_effort"), default="reliable", help="QoS reliability for --odom-topic (Spot's driver often needs best_effort)")
@@ -184,7 +191,7 @@ def main() -> int:
         host=args.host,
         port=args.port,
         query_examples=query_examples,
-        live_rgb_enabled=False,
+        live_rgb_enabled=bool(args.ws_url) and not args.ws_no_image,
         image_pose_axes_enabled=False,
         object_image_connections_enabled=False,
         covisibility_connections_enabled=False,
@@ -257,14 +264,36 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 - nav graph is optional context
             print(f"Skipping nav graph ({exc})")
 
+    # Shared alignment for any live odometry source (--odom-topic or --ws-url).
+    world_transform = None
+    if args.world_transform is not None:
+        world_transform = np.asarray(args.world_transform, dtype=np.float64).reshape(4, 4)
+    elif isinstance(state.get("world_transform"), (list, np.ndarray)):
+        world_transform = np.asarray(state["world_transform"], dtype=np.float64).reshape(4, 4)
+        print("Using world_transform stored in the scene state for live odometry alignment")
+
+    ws_client = None
+    if args.ws_url:
+        try:
+            from ros_ws_client import RosWsClient
+
+            ws_client = RosWsClient(
+                args.ws_url,
+                world_transform=world_transform,
+                want_image=not args.ws_no_image,
+            )
+            ws_client.start()
+            print(
+                f"Connecting to ROS bridge {args.ws_url} — robot pose + trail"
+                + ("" if args.ws_no_image else " + Live RGB panel")
+                + " will stream in."
+            )
+        except Exception as exc:  # noqa: BLE001 - stream is optional context
+            print(f"Could not start WebSocket client ({exc}); continuing without it.")
+            ws_client = None
+
     odom_listener = None
     if args.odom_topic:
-        world_transform = None
-        if args.world_transform is not None:
-            world_transform = np.asarray(args.world_transform, dtype=np.float64).reshape(4, 4)
-        elif isinstance(state.get("world_transform"), (list, np.ndarray)):
-            world_transform = np.asarray(state["world_transform"], dtype=np.float64).reshape(4, 4)
-            print("Using world_transform stored in the scene state for odometry alignment")
         try:
             from odom_ros_listener import OdomRosListener
 
@@ -286,20 +315,33 @@ def main() -> int:
             odom_listener = None
 
     print(f"Serving on http://localhost:{args.port} — Ctrl+C to stop.")
+    last_image_stamp = None
     try:
         while True:
+            active = False
             if odom_listener is not None:
                 stamp, pose = odom_listener.latest()
                 if pose is not None:
                     visualizer.set_robot_pose(pose, stamp=stamp)
-                time.sleep(0.1)
-            else:
-                time.sleep(2.0)
+                active = True
+            if ws_client is not None:
+                stamp, pose = ws_client.latest_odom()
+                if pose is not None:
+                    visualizer.set_robot_pose(pose, stamp=stamp)
+                if not args.ws_no_image:
+                    istamp, image = ws_client.latest_image()
+                    if image is not None and istamp != last_image_stamp:
+                        visualizer.set_live_rgb(image, caption=f"Live camera @ {istamp:.1f}s")
+                        last_image_stamp = istamp
+                active = True
+            time.sleep(0.1 if active else 2.0)
     except KeyboardInterrupt:
         print("Bye.")
     finally:
         if odom_listener is not None:
             odom_listener.stop()
+        if ws_client is not None:
+            ws_client.stop()
     return 0
 
 
