@@ -178,6 +178,7 @@ def main() -> int:
     parser.add_argument("--walk", type=Path, default=None, help="Spot GraphNav / Autowalk '.walk' directory (or its 'graph' protobuf) to overlay: one coordinate frame per waypoint pose, connecting edges, name labels, and anchored fiducials. Toggle in the 'Nav graph' GUI panel.")
     parser.add_argument("--walk-anchor", choices=("auto", "seed", "bfs"), default="auto", help="How to lift waypoint poses into one frame: 'auto' uses the map's anchoring (seed frame) if present else BFS over edge transforms; 'seed' requires an anchored map; 'bfs' always composes edge transforms from the first waypoint")
     parser.add_argument("--walk-transform", type=float, nargs=16, default=None, metavar="M", help="Row-major 4x4 applied to every waypoint/anchor pose after resolving (residual nudge onto the scene frame)")
+    parser.add_argument("--no-camera-trajectory", action="store_true", help="Don't draw the scene's capture path (one small coordinate frame per RGB image pose, the '/trajectory' loop). Useful when overlaying a '--walk' nav graph instead.")
     parser.add_argument("--no-grid", action="store_true", help="Disable the metric ground grid overlay (on by default; also toggleable in the 'Metric grid' GUI panel)")
     parser.add_argument("--grid-cell-m", type=float, default=1.0, help="Metric grid cell size in meters (adjustable live in the GUI)")
     parser.add_argument("--query-examples", type=Path, default=None, help="Text file with one query per line for the Query panel's Examples dropdown (default: derive examples from the scene's own captioned objects)")
@@ -267,16 +268,17 @@ def main() -> int:
 
     visualizer.update(colors=[], depths=[], intrinsics=[], poses=[], scene_state=state)
     poses = []
-    for rec in state.get("images") or []:
-        pose = _record_field(rec, "pose")
-        if pose is None:
-            continue
-        try:
-            arr = np.asarray(pose.cpu().numpy() if hasattr(pose, "cpu") else pose, dtype=np.float32)
-        except Exception:
-            continue
-        if arr.shape == (4, 4) and np.isfinite(arr).all():
-            poses.append(arr)
+    if not args.no_camera_trajectory:
+        for rec in state.get("images") or []:
+            pose = _record_field(rec, "pose")
+            if pose is None:
+                continue
+            try:
+                arr = np.asarray(pose.cpu().numpy() if hasattr(pose, "cpu") else pose, dtype=np.float32)
+            except Exception:
+                continue
+            if arr.shape == (4, 4) and np.isfinite(arr).all():
+                poses.append(arr)
     if poses:
         try:
             visualizer.add_trajectory(np.stack(poses))
@@ -306,12 +308,26 @@ def main() -> int:
                 extra_transform=walk_transform,
             )
             visualizer.add_nav_graph(nav_graph)
+            wp = nav_graph.waypoint_positions()
             print(
                 f"Nav graph: {len(nav_graph.waypoints)} waypoints, "
                 f"{len(nav_graph.edge_segments())} edges, "
                 f"{len(nav_graph.anchored_objects)} anchored objects "
                 f"(frame={nav_graph.frame}) from {args.walk}"
             )
+            if wp.shape[0] and frame_points is not None and len(frame_points):
+                fp = np.asarray(frame_points, dtype=np.float64).reshape(-1, 3)
+                wp_c = wp.mean(axis=0)
+                sc_c = fp.mean(axis=0)
+                gap = float(np.linalg.norm(wp_c - sc_c))
+                sc_span = float(np.linalg.norm(fp.max(0) - fp.min(0)))
+                if gap > 0.5 * sc_span + 5.0:
+                    print(
+                        f"  ⚠ waypoints centre {np.round(wp_c, 1)} is {gap:.0f} m from the scene "
+                        f"centre {np.round(sc_c, 1)} — the '.walk' seed frame and this scene are "
+                        f"not aligned. They will render off to one side. Pass --walk-transform / "
+                        f"--walk-anchor bfs, or check this is the right .walk for this scene."
+                    )
         except Exception as exc:  # noqa: BLE001 - nav graph is optional context
             print(f"Skipping nav graph ({exc})")
 

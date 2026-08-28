@@ -1969,6 +1969,9 @@ class PipelineViserVisualizer:
         # Remove the navigation-pose markers.
         self._clear_navigation_poses()
         self._last_query_results = None
+        # Wipe the accumulated live-odometry trail (+ the red /robot_trajectory)
+        # so the path restarts from the next incoming pose.
+        self._clear_live_odometry()
         if self._server is not None and self._latest_scene_state is not None:
             with contextlib.suppress(Exception):
                 with self._server.atomic():
@@ -3027,6 +3030,26 @@ class PipelineViserVisualizer:
             idx = np.linspace(0, len(keep) - 1, cap).round().astype(int)
             keep = sorted(set(keep[i] for i in idx) | {keep[-1]})
         return keep
+
+    def _clear_live_odometry(self) -> None:
+        """Drop the accumulated live-odometry trail + the red /robot_trajectory
+        so the path restarts from the next incoming pose (used by Reset view)."""
+        self._live_odom_positions = []
+        self._live_odom_wxyz = []
+        self._live_odom_stamps = []
+        self._robot_trajectory_positions = []
+        for attr in (
+            "_live_odom_trail_handle", "_live_odom_axes_handle",
+            "_live_odom_current_frame", "_robot_trajectory_handle", "_robot_pose_frame",
+        ):
+            h = getattr(self, attr, None)
+            if h is not None:
+                with contextlib.suppress(Exception):
+                    h.remove()
+                setattr(self, attr, None)
+        if self._server is not None:
+            with contextlib.suppress(Exception):
+                self._server.flush()
 
     def _redraw_live_odometry(self, *, current_T: np.ndarray | None = None) -> None:
         if self._server is None:
