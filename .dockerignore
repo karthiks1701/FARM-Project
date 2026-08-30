@@ -21,3 +21,4 @@ output
 models/*
 !models/dinov3-vits16
 !models/dinov3-vits16/**
+data/
