@@ -134,9 +134,10 @@ class PipelineViserVisualizer:
         host: str = "127.0.0.1",
         port: int = 8080,
         live_rgb_enabled: bool = True,
-        live_rgb_max_side: int = 320,
+        live_rgb_max_side: int = 1280,
         live_rgb_max_fps: float = 5.0,
         object_gaussians_enabled: bool = False,
+        object_boxes_start_hidden: bool = False,
         object_connections_enabled: bool = False,
         regions_enabled: bool = True,
         covisibility_connections_enabled: bool = False,
@@ -175,6 +176,8 @@ class PipelineViserVisualizer:
         self._live_rgb_max_side = max(1, int(live_rgb_max_side))
         self._live_rgb_max_fps = max(0.0, float(live_rgb_max_fps))
         self._object_gaussians_enabled = bool(object_gaussians_enabled)
+        self._object_boxes_all_visible = not bool(object_boxes_start_hidden)
+        self._object_boxes_checkbox = None
         self._object_connections_enabled = bool(object_connections_enabled)
         self._regions_enabled = bool(regions_enabled)
         self._covisibility_connections_enabled = bool(covisibility_connections_enabled)
@@ -268,6 +271,8 @@ class PipelineViserVisualizer:
         self._server = None
         self._latest_client = None
         self._home_camera: tuple[np.ndarray, np.ndarray] | None = None
+        self._home_up: np.ndarray | None = None
+        self._top_down_view: bool = False
         self._query_examples_dropdown = None
         self._query_examples_ready = False
         self._query_examples_override = [
@@ -293,6 +298,7 @@ class PipelineViserVisualizer:
         # via scripts/view_scene_state.py). ROS-free: the caller converts the
         # message and applies any map/seed-frame alignment first.
         self._robot_pose_frame = None
+        self._spot_marker_prefixes: set[str] = set()
         self._live_robot_pose: np.ndarray | None = None
         self._live_robot_stamp: float | None = None
         # Separate live-odometry overlay (e.g. the WebSocket /odometry stream):
@@ -320,7 +326,7 @@ class PipelineViserVisualizer:
         # Collision-aware navigation-pose markers drawn in the 3D scene after a
         # query (footprint ring + heading + connector to the object centre).
         self._nav_pose_handles: list = []
-        self._nav_pose_show: bool = True
+        self._nav_pose_show: bool = False
         self._nav_pose_show_checkbox = None
         self._last_query_results: list | None = None
         self._latest_scene_state: dict | None = None
@@ -348,6 +354,9 @@ class PipelineViserVisualizer:
         self._query_input = None
         self._query_search_button = None
         self._query_results_display = None
+        self._query_panel = None
+        self._query_matches_folder = None
+        self._match_widget_handles = []
         self._reset_button = None
         self._retrieval_backend_button = None
         self._retrieval_status = None
@@ -398,13 +407,24 @@ class PipelineViserVisualizer:
 
         try:
             self._server = viser.ViserServer(host=self._host, port=self._port)
+            with contextlib.suppress(Exception):
+                self._server.gui.configure_theme(control_width="large")
             self._camera_frame = self._server.scene.add_frame(name="/camera_pose", axes_length=0.25, axes_radius=0.01)
 
             gui = getattr(self._server, "gui", None)
             if gui is not None:
                 if self._live_rgb_enabled:
                     try:
-                        with gui.add_folder("Live RGB"):
+                        try:
+                            _rgb_panel = gui.add_panel()
+                            _rgb_ctx = _rgb_panel.add_tab("Live RGB")
+                            with contextlib.suppress(Exception):
+                                _rgb_panel.dock_right()
+                            with contextlib.suppress(Exception):
+                                _rgb_panel.set_width(680)
+                        except Exception:
+                            _rgb_ctx = gui.add_folder("Live RGB")
+                        with _rgb_ctx:
                             self._live_rgb_caption = gui.add_markdown("Waiting for RGB frames.")
                             placeholder = np.zeros((64, 64, 3), dtype=np.uint8)
                             self._live_rgb_display = gui.add_image(
@@ -441,7 +461,7 @@ class PipelineViserVisualizer:
                     threading.Thread(
                         target=self._try_set_camera,
                         args=(client,),
-                        kwargs={"position": home[0], "look_at": home[1]},
+                        kwargs={"position": home[0], "look_at": home[1], "up": self._home_up},
                         daemon=True,
                     ).start()
 
@@ -576,7 +596,7 @@ class PipelineViserVisualizer:
             )
             self._server.flush()
 
-    def set_home_view(self, points: np.ndarray | None) -> None:
+    def set_home_view(self, points: np.ndarray | None, *, top_down: bool | None = None) -> None:
         """Frame *points* (Nx3) with an elevated 3/4 overview camera.
 
         Applied to already-connected clients and to every client that connects
@@ -598,15 +618,24 @@ class PipelineViserVisualizer:
         horiz = [i for i in range(3) if i != up_axis]
         dist = max(float(np.linalg.norm(extent)) * 0.55, 2.0)
         offset = np.zeros(3)
-        offset[horiz[0]] = 0.50 * dist
-        offset[horiz[1]] = -0.40 * dist
-        offset[up_axis] = 0.70 * dist
+        want_top_down = self._top_down_view if top_down is None else bool(top_down)
+        if want_top_down:
+            # Camera straight above the scene centre, looking down the up axis.
+            offset[up_axis] = max(float(extent[horiz[0]]), float(extent[horiz[1]])) * 0.75 + dist
+            up_vec = np.zeros(3)
+            up_vec[horiz[0]] = 1.0
+            self._home_up = up_vec.astype(np.float32)
+        else:
+            offset[horiz[0]] = 0.50 * dist
+            offset[horiz[1]] = -0.40 * dist
+            offset[up_axis] = 0.70 * dist
+            self._home_up = None
         self._home_camera = ((center + offset).astype(np.float32), center.astype(np.float32))
         clients: dict = {}
         with contextlib.suppress(Exception):
             clients = self._server.get_clients()
         for client in clients.values():
-            self._try_set_camera(client, position=self._home_camera[0], look_at=self._home_camera[1])
+            self._try_set_camera(client, position=self._home_camera[0], look_at=self._home_camera[1], up=self._home_up)
 
     # ------------------------------------------------------------------
     # Metric ground grid
@@ -744,8 +773,8 @@ class PipelineViserVisualizer:
         self,
         nav_graph,
         *,
-        axes_length: float = 0.25,
-        show_labels: bool = True,
+        axes_length: float = 0.0,
+        show_labels: bool = False,
         visible: bool = True,
     ) -> None:
         """Overlay a Spot ``.walk`` nav graph: one coordinate frame per waypoint
@@ -758,7 +787,7 @@ class PipelineViserVisualizer:
         if not self._enabled or self._server is None or nav_graph is None:
             return
         self._nav_graph = nav_graph
-        self._nav_graph_axes_length = max(0.02, float(axes_length))
+        self._nav_graph_axes_length = max(0.0, float(axes_length))
         self._nav_graph_labels_visible = bool(show_labels)
         self._nav_graph_visible = bool(visible)
         self._setup_nav_graph_gui()
@@ -779,7 +808,7 @@ class PipelineViserVisualizer:
                     gui, "Waypoint labels", self._nav_graph_labels_visible
                 )
                 self._nav_graph_axes_slider = self._gui_add_slider(
-                    gui, "Waypoint axes (m)", min_v=0.05, max_v=1.0, step=0.05,
+                    gui, "Waypoint axes (m)", min_v=0.0, max_v=1.0, step=0.05,
                     initial=self._nav_graph_axes_length,
                 )
         except Exception:
@@ -807,7 +836,7 @@ class PipelineViserVisualizer:
                 self._nav_graph_labels_visible = bool(self._nav_graph_labels_checkbox.value)
         with contextlib.suppress(Exception):
             if self._nav_graph_axes_slider is not None:
-                self._nav_graph_axes_length = max(0.02, float(self._nav_graph_axes_slider.value))
+                self._nav_graph_axes_length = max(0.0, float(self._nav_graph_axes_slider.value))
         self._redraw_nav_graph()
 
     _NAV_GRAPH_LABEL_CAP = 250
@@ -831,17 +860,18 @@ class PipelineViserVisualizer:
 
         with contextlib.suppress(Exception):
             with self._server.atomic():
-                # Waypoint orientation frames.
-                with contextlib.suppress(Exception):
-                    self._nav_graph_handles.append(
-                        self._server.scene.add_batched_axes(
-                            "/nav_graph/waypoints",
-                            batched_wxyzs=wxyzs,
-                            batched_positions=positions,
-                            axes_length=axes_len,
-                            axes_radius=max(0.004, axes_len * 0.04),
+                # Waypoint orientation frames (only when "Waypoint axes (m)" > 0).
+                if axes_len > 1e-6:
+                    with contextlib.suppress(Exception):
+                        self._nav_graph_handles.append(
+                            self._server.scene.add_batched_axes(
+                                "/nav_graph/waypoints",
+                                batched_wxyzs=wxyzs,
+                                batched_positions=positions,
+                                axes_length=axes_len,
+                                axes_radius=max(0.004, axes_len * 0.04),
+                            )
                         )
-                    )
                 # Waypoint dots (always visible even when zoomed out).
                 with contextlib.suppress(Exception):
                     self._nav_graph_handles.append(
@@ -867,17 +897,20 @@ class PipelineViserVisualizer:
                 anchor_pos = nav.anchored_object_positions()
                 if anchor_pos.shape[0] > 0:
                     anchor_wxyz = np.tile(np.array([1.0, 0.0, 0.0, 0.0], np.float32), (anchor_pos.shape[0], 1))
-                    with contextlib.suppress(Exception):
-                        self._nav_graph_handles.append(
-                            self._server.scene.add_batched_axes(
-                                "/nav_graph/anchors",
-                                batched_wxyzs=anchor_wxyz,
-                                batched_positions=anchor_pos,
-                                axes_length=max(0.3, axes_len * 2.0),
-                                axes_radius=max(0.008, axes_len * 0.08),
+                    if axes_len > 1e-6:
+                        with contextlib.suppress(Exception):
+                            self._nav_graph_handles.append(
+                                self._server.scene.add_batched_axes(
+                                    "/nav_graph/anchors",
+                                    batched_wxyzs=anchor_wxyz,
+                                    batched_positions=anchor_pos,
+                                    axes_length=max(0.3, axes_len * 2.0),
+                                    axes_radius=max(0.008, axes_len * 0.08),
+                                )
                             )
-                        )
                     for i, obj in enumerate(nav.anchored_objects):
+                        if not self._nav_graph_labels_visible:
+                            break
                         p = obj.T_world[:3, 3]
                         with contextlib.suppress(Exception):
                             self._nav_graph_handles.append(
@@ -1338,7 +1371,18 @@ class PipelineViserVisualizer:
             return
 
         try:
-            with gui.add_folder("Query"):
+            try:
+                panel = gui.add_panel()
+                self._query_panel = panel
+                container = panel.add_tab("Query")
+                with contextlib.suppress(Exception):
+                    panel.dock_left()
+                with contextlib.suppress(Exception):
+                    panel.set_width(680)
+            except Exception:
+                self._query_panel = None
+                container = gui.add_folder("Query")
+            with container:
                 self._retrieval_backend_button = self._gui_add_button(gui, "Start vLLM retrieval backend")
                 self._retrieval_status = gui.add_markdown("Backend: not started.")
                 with contextlib.suppress(Exception):
@@ -1354,6 +1398,8 @@ class PipelineViserVisualizer:
                     gui, "Show navigation poses", self._nav_pose_show
                 )
                 self._query_results_display = gui.add_markdown("")
+                with contextlib.suppress(Exception):
+                    self._query_matches_folder = gui.add_folder("Top matches")
         except Exception:
             return
 
@@ -1757,7 +1803,7 @@ class PipelineViserVisualizer:
         # map always agree on both count and identity — no separate top-5 cap
         # here (that used to make the text list shorter than the box set).
         results = []
-        for cand in scored:
+        for cand in scored[:12]:
             cap = ""
             oi = int(cand.object_index)
             if 0 <= oi < len(captions) and isinstance(captions[oi], str):
@@ -1772,7 +1818,7 @@ class PipelineViserVisualizer:
         # table") are intentionally NOT added here — they're context, not
         # results, and used only for the relation-edge overlay (edge_anchor_ids
         # below), not for box visibility.
-        candidate_ids: set[int] = {int(cand.object_id) for cand in scored}
+        candidate_ids: set[int] = {int(cand.object_id) for cand in scored[:12]}
         anchor_ids: set[int] = set()
         for cand in scored:
             # Per-candidate matched anchors (populated for regular predicates).
@@ -1904,28 +1950,14 @@ class PipelineViserVisualizer:
         for note in (roles or {}).get("dropped", [])[:3]:
             lines.append(f"· ⚠ _{note} — constraint not applied_")
         lines.append("")
-        lines.append("**Top matches:** _(pos = object centre; nav = collision-aware robot goal)_")
-        for rank, (obj_id, score, caption, pos, nav) in enumerate(results, start=1):
-            cap = (caption or "(no caption)").strip()
-            pos_str = f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})" if pos is not None else "(no position)"
-            lines.append(f"{rank}. `#{obj_id}` ({score:.3f}) — pos {pos_str} — {cap}")
-            if nav is not None:
-                nx, ny, nz = nav.position
-                flag = "✅" if nav.navigable else "⚠️ no body-safe pose"
-                lines.append(
-                    f"    ↳ nav ({nx:.2f}, {ny:.2f}, {nz:.2f}) yaw {math.degrees(nav.yaw_rad):.0f}° · "
-                    f"clearance {nav.clearance_m:.2f} m / {nav.required_clearance_m:.2f} m required · "
-                    f"offset {nav.offset_from_target_m:.2f} m · {flag}"
-                )
-        lines.append("")
-        lines.append("_Others hidden — click **Reset view** to restore._")
+        lines.append(f"**Top {min(len(results), 12)} matches** — pick a number under the grid to isolate its box; **Reset view** restores all.")
         self._gui_set_markdown(self._query_results_display, "\n\n".join(lines))
+        self._render_top_matches(results)
 
         # Hide everything except target + distractors + anchors (color-coded
-        # by role), then fly to #1 and draw its relation edges.
+        # by role). Camera is left fixed (top-down); no auto fly-to.
         self._query_roles = roles
         self._apply_focus(focus_ids)
-        self._jump_to_object_id(results[0][0])
 
         # Draw the collision-aware navigation pose for every match in the 3D
         # scene: a footprint ring + heading arrow + a connector to the object
@@ -1934,10 +1966,113 @@ class PipelineViserVisualizer:
         if self._nav_pose_show:
             self._draw_navigation_poses(results)
 
-        # Record where the robot was (live ROS /odometry) when this query ran.
-        if self._live_robot_pose is not None:
+
+    def _match_thumb_uri(self, obj_id: int) -> str | None:
+        """A small JPEG data: URI of the object's crop for the match grid."""
+        try:
+            if self._latest_ids is None:
+                return None
+            m = np.where(self._latest_ids == obj_id)[0]
+            if m.size == 0:
+                return None
+            idx = int(m[0])
+            img_raw = self._latest_images[idx] if idx < len(self._latest_images) else None
+            no_crop = img_raw is None or (isinstance(img_raw, (list, tuple, dict)) and len(img_raw) == 0)
+            if no_crop and self._latest_view_refs is not None and idx < len(self._latest_view_refs):
+                img_raw = self._load_image_ref(self._latest_view_refs[idx])
+            arr = self._prepare_image_gallery(img_raw)
+            if arr is None:
+                return None
+            arr = self._resize_longest_side(np.asarray(arr), 260).astype("uint8")
+            import io as _io, base64 as _b64
+            from PIL import Image as _Image
+            buf = _io.BytesIO()
+            _Image.fromarray(arr).convert("RGB").save(buf, format="JPEG", quality=82)
+            return "data:image/jpeg;base64," + _b64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            return None
+
+    def _render_top_matches(self, results: list) -> None:
+        """(Re)build the 'Top matches' section: a 3-wide grid (up to 12) of
+        object thumbnails with a big rank number + position, plus a button
+        group that isolates a single match's box."""
+        gui = getattr(self._server, "gui", None) if self._server is not None else None
+        folder = self._query_matches_folder
+        if gui is None or folder is None:
+            return
+        for h in self._match_widget_handles:
             with contextlib.suppress(Exception):
-                self.mark_query_pose(query, self._live_robot_pose)
+                h.remove()
+        self._match_widget_handles = []
+        top = list(results[:12])
+        if not top:
+            return
+        try:
+            with folder:
+                cells = []
+                for rank, (obj_id, score, caption, pos, nav) in enumerate(top, start=1):
+                    pos_str = (
+                        f"{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}" if pos is not None else "no pos"
+                    )
+                    uri = self._match_thumb_uri(int(obj_id))
+                    if uri:
+                        img = (
+                            f"<img src='{uri}' style='width:100%;aspect-ratio:1;"
+                            "object-fit:cover;border-radius:5px;display:block'>"
+                        )
+                    else:
+                        img = (
+                            "<div style='width:100%;aspect-ratio:1;border-radius:5px;"
+                            "background:rgba(128,128,128,.2)'></div>"
+                        )
+                    cells.append(
+                        "<div style='min-width:0'>"
+                        + img
+                        + f"<div style='font-size:1.7em;font-weight:800;line-height:1.15'>{rank}"
+                        + f"<span style='font-size:.42em;font-weight:400;opacity:.6'> #{obj_id}</span></div>"
+                        + f"<div style='font-size:.82em;opacity:.75'>{pos_str}</div>"
+                        + "</div>"
+                    )
+                grid = (
+                    "<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:12px 8px'>"
+                    + "".join(cells)
+                    + "</div>"
+                )
+                with contextlib.suppress(Exception):
+                    self._match_widget_handles.append(gui.add_html(grid))
+
+                ids = [int(r[0]) for r in top]
+                bg = None
+                with contextlib.suppress(Exception):
+                    bg = gui.add_button_group(
+                        "Show only", [str(i) for i in range(1, len(top) + 1)]
+                    )
+                if bg is not None:
+                    self._match_widget_handles.append(bg)
+
+                    @bg.on_click
+                    def _(_e=None, ids=ids):
+                        try:
+                            k = int(bg.value) - 1
+                        except Exception:
+                            return
+                        if 0 <= k < len(ids):
+                            oid = ids[k]
+                            self._apply_focus({oid})
+                            with contextlib.suppress(Exception):
+                                self._handle_object_click(oid)
+
+                allbtn = None
+                with contextlib.suppress(Exception):
+                    allbtn = gui.add_button("Show all matches")
+                if allbtn is not None:
+                    self._match_widget_handles.append(allbtn)
+
+                    @allbtn.on_click
+                    def _(_e=None, ids=set(ids)):
+                        self._apply_focus(ids)
+        except Exception as exc:
+            LOGGER.warning("Failed to render top matches: %s", exc)
 
     def _apply_focus(self, focus_ids: set[int] | None) -> None:
         """Hide all objects except *focus_ids* (None restores everything)."""
@@ -1954,6 +2089,15 @@ class PipelineViserVisualizer:
     def _reset_view(self) -> None:
         """Clear query focus + search overlays and restore the original view."""
         self._focus_object_ids = None
+        # Reset view brings every object box back.
+        self._object_boxes_all_visible = True
+        with contextlib.suppress(Exception):
+            if self._object_boxes_checkbox is not None:
+                self._object_boxes_checkbox.value = True
+        for _h in getattr(self, "_match_widget_handles", []):
+            with contextlib.suppress(Exception):
+                _h.remove()
+        self._match_widget_handles = []
         # Remove the search highlight box/edges and path drawn for the last query.
         for attr in ("_search_highlight_box_handle", "_search_highlight_edges_handle", "_search_relations_handle", "_search_path_handle"):
             handle = getattr(self, attr, None)
@@ -1983,7 +2127,7 @@ class PipelineViserVisualizer:
             with contextlib.suppress(Exception):
                 clients = self._server.get_clients()
             for client in clients.values():
-                self._try_set_camera(client, position=home[0], look_at=home[1])
+                self._try_set_camera(client, position=home[0], look_at=home[1], up=self._home_up)
         self._gui_set_markdown(self._query_results_display, "_View reset._")
 
     # ------------------------------------------------------------------
@@ -2142,8 +2286,27 @@ class PipelineViserVisualizer:
                 self._max_side_slider = self._gui_add_slider(
                     gui, "Max box side (m)", min_v=0.1, max_v=ceiling, step=0.1, initial=initial
                 )
+                self._object_boxes_checkbox = self._gui_add_checkbox(
+                    gui, "Show all object boxes", self._object_boxes_all_visible
+                )
         except Exception:
             return
+
+        cb = self._object_boxes_checkbox
+        if cb is not None:
+            on_update = getattr(cb, "on_update", None)
+            if callable(on_update):
+                with contextlib.suppress(Exception):
+
+                    @on_update
+                    def _(_event=None):
+                        with contextlib.suppress(Exception):
+                            self._object_boxes_all_visible = bool(cb.value)
+                        if self._server is not None and self._latest_scene_state is not None:
+                            with contextlib.suppress(Exception):
+                                with self._server.atomic():
+                                    self._update_gaussians(self._latest_scene_state)
+                                self._server.flush()
 
         # Apply the initial value (unless it's the ceiling, which means "off").
         self._object_box_max_side_m = 0.0 if initial >= ceiling else initial
@@ -2780,10 +2943,13 @@ class PipelineViserVisualizer:
         return pos, look
 
     @staticmethod
-    def _try_set_camera(client: object, *, position: np.ndarray, look_at: np.ndarray) -> None:
+    def _try_set_camera(client: object, *, position: np.ndarray, look_at: np.ndarray, up: np.ndarray | None = None) -> None:
         cam = getattr(client, "camera", None)
         if cam is None:
             return
+        if up is not None:
+            with contextlib.suppress(Exception):
+                cam.up_direction = up
         # Best-effort across viser versions.
         with contextlib.suppress(Exception):
             if hasattr(cam, "position"):
@@ -2896,6 +3062,37 @@ class PipelineViserVisualizer:
             line_width=4.0,
         )
 
+    def _ensure_spot_marker(self, prefix: str) -> None:
+        """Draw a low-poly Spot (yellow body + dark head + 4 legs + red nose)
+        once, parented to the pose frame *prefix* so it follows the robot.
+        +X is forward, +Z up."""
+        if self._server is None or prefix in self._spot_marker_prefixes:
+            return
+        YEL = (245, 197, 0)
+        DARK = (45, 45, 45)
+        LEG = (70, 70, 70)
+        parts = [
+            ("body", (0.88, 0.24, 0.18), (0.0, 0.0, 0.0), YEL),
+            ("head", (0.16, 0.20, 0.13), (0.40, 0.0, 0.02), DARK),
+            ("nose", (0.06, 0.06, 0.06), (0.50, 0.0, 0.0), (255, 60, 60)),
+            ("leg_fl", (0.05, 0.05, 0.32), (0.32, 0.11, -0.24), LEG),
+            ("leg_fr", (0.05, 0.05, 0.32), (0.32, -0.11, -0.24), LEG),
+            ("leg_bl", (0.05, 0.05, 0.32), (-0.32, 0.11, -0.24), LEG),
+            ("leg_br", (0.05, 0.05, 0.32), (-0.32, -0.11, -0.24), LEG),
+        ]
+        try:
+            for name, dims, pos, color in parts:
+                with contextlib.suppress(Exception):
+                    self._server.scene.add_box(
+                        name=f"{prefix}/spot/{name}",
+                        dimensions=dims,
+                        position=pos,
+                        color=color,
+                    )
+            self._spot_marker_prefixes.add(prefix)
+        except Exception:
+            pass
+
     def set_robot_pose(self, T_world_robot: np.ndarray, *, stamp: float | None = None) -> None:
         """Push an externally-sourced robot pose (e.g. live ROS ``/odometry``)
         into the scene: moves a ``/robot_pose`` coordinate frame and extends the
@@ -2921,8 +3118,9 @@ class PipelineViserVisualizer:
             with self._server.atomic():
                 if self._robot_pose_frame is None:
                     self._robot_pose_frame = self._server.scene.add_frame(
-                        name="/robot_pose", axes_length=0.3, axes_radius=0.012
+                        name="/robot_pose", show_axes=False
                     )
+                    self._ensure_spot_marker("/robot_pose")
                 rotation, translation = T[:3, :3], T[:3, 3]
                 if SO3 is not None and hasattr(self._robot_pose_frame, "wxyz"):
                     self._robot_pose_frame.wxyz = SO3.from_matrix(rotation).wxyz
@@ -3004,9 +3202,9 @@ class PipelineViserVisualizer:
             with self._server.atomic():
                 if self._live_odom_current_frame is None:
                     self._live_odom_current_frame = self._server.scene.add_frame(
-                        name="/live_odom/current", axes_length=length,
-                        axes_radius=max(0.006, length * 0.06),
+                        name="/live_odom/current", show_axes=False
                     )
+                    self._ensure_spot_marker("/live_odom/current")
                 if SO3 is not None and hasattr(self._live_odom_current_frame, "wxyz"):
                     self._live_odom_current_frame.wxyz = SO3.from_matrix(np.asarray(T[:3, :3])).wxyz
                 if hasattr(self._live_odom_current_frame, "position"):
@@ -3047,6 +3245,8 @@ class PipelineViserVisualizer:
                 with contextlib.suppress(Exception):
                     h.remove()
                 setattr(self, attr, None)
+        self._spot_marker_prefixes.discard("/live_odom/current")
+        self._spot_marker_prefixes.discard("/robot_pose")
         if self._server is not None:
             with contextlib.suppress(Exception):
                 self._server.flush()
@@ -3065,6 +3265,7 @@ class PipelineViserVisualizer:
                 with contextlib.suppress(Exception):
                     self._live_odom_current_frame.remove()
                 self._live_odom_current_frame = None
+                self._spot_marker_prefixes.discard("/live_odom/current")
             with contextlib.suppress(Exception):
                 self._server.flush()
             return
@@ -4332,6 +4533,15 @@ class PipelineViserVisualizer:
             # the display filters (max box side etc.) apply uniformly to
             # focused and unfocused boxes alike.
             in_focus = self._focus_object_ids is not None and obj_int in self._focus_object_ids
+            # Clean-map mode: with no active query focus, draw no object
+            # boxes at all unless the user ticks 'Show all object boxes'.
+            if self._focus_object_ids is None and not self._object_boxes_all_visible:
+                _h = self._object_cube_handles.get(obj_int)
+                if _h is not None:
+                    seen_ids.add(obj_int)
+                    with contextlib.suppress(Exception):
+                        _h.visible = False
+                continue
             if idx < len(visible_by_idx) and not bool(visible_by_idx[idx]):
                 handle = self._object_cube_handles.pop(obj_int, None)
                 if handle is not None:
@@ -4745,7 +4955,7 @@ class PipelineViserVisualizer:
         except Exception as exc:
             LOGGER.info("Anchor view unavailable (%s): %s", ref, exc)
             return None
-        arr = self._resize_longest_side(arr, 480)
+        arr = self._resize_longest_side(arr, 720)
         self._view_image_cache[ref] = arr
         if len(self._view_image_cache) > 64:
             self._view_image_cache.pop(next(iter(self._view_image_cache)))

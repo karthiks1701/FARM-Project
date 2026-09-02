@@ -31,6 +31,8 @@ Live odometry is aligned to the map by ``DEFAULT_SEED_TFORM_BODY`` (a
 ``seed_tform_body`` baked into this script); override with ``--world-transform``
 / ``--world-transform-se3`` or disable with ``--no-world-transform``.
 
+#   python scripts/view_scene_state.py --pt data/spot_scene_graph_caption_4_seed_1.pt --walk /data/walks/site.walk --grid-cell-m 1.0 --ws-url ws://192.168.1.192:8765
+
 A metric ground grid is drawn by default (``--no-grid`` to suppress, or toggle
 it in the **Metric grid** GUI panel). ``--walk`` overlays a Boston Dynamics
 GraphNav / Autowalk ``.walk`` map: one coordinate frame per waypoint pose,
@@ -179,6 +181,8 @@ def main() -> int:
     parser.add_argument("--walk-anchor", choices=("auto", "seed", "bfs"), default="auto", help="How to lift waypoint poses into one frame: 'auto' uses the map's anchoring (seed frame) if present else BFS over edge transforms; 'seed' requires an anchored map; 'bfs' always composes edge transforms from the first waypoint")
     parser.add_argument("--walk-transform", type=float, nargs=16, default=None, metavar="M", help="Row-major 4x4 applied to every waypoint/anchor pose after resolving (residual nudge onto the scene frame)")
     parser.add_argument("--no-camera-trajectory", action="store_true", help="Don't draw the scene's capture path (one small coordinate frame per RGB image pose, the '/trajectory' loop). Useful when overlaying a '--walk' nav graph instead.")
+    parser.add_argument("--show-all-boxes", action="store_true", help="Draw every object box on load. Default: boxes stay hidden until a query (or a Top-matches isolate click) focuses some; toggle live in Filters.")
+    parser.add_argument("--top-down", action="store_true", help="Open with a fixed top-down (bird's-eye) camera looking straight down the up axis, and keep that orientation on every client connect / view reset.")
     parser.add_argument("--no-grid", action="store_true", help="Disable the metric ground grid overlay (on by default; also toggleable in the 'Metric grid' GUI panel)")
     parser.add_argument("--grid-cell-m", type=float, default=1.0, help="Metric grid cell size in meters (adjustable live in the GUI)")
     parser.add_argument("--query-examples", type=Path, default=None, help="Text file with one query per line for the Query panel's Examples dropdown (default: derive examples from the scene's own captioned objects)")
@@ -251,6 +255,7 @@ def main() -> int:
         object_voxel_cloud_enabled=args.voxel_points_per_object > 0,
         object_voxel_max_points_per_object=max(0, args.voxel_points_per_object),
         object_box_from_voxels=True,
+        object_boxes_start_hidden=not args.show_all_boxes,
     )
     if not visualizer.enabled:
         print("viser is not available in this environment — aborting.")
@@ -286,7 +291,7 @@ def main() -> int:
             print(f"Skipping trajectory ({exc})")
     if frame_points is None and isinstance(means, torch.Tensor) and means.numel():
         frame_points = means.detach().cpu().numpy().reshape(-1, 3)
-    visualizer.set_home_view(frame_points)
+    visualizer.set_home_view(frame_points, top_down=args.top_down)
 
     if not args.no_grid:
         try:

@@ -20,7 +20,7 @@ models/*
 /output/
 /log/
 FARM-Project-*.tar.gz
-
+data/
 # Colcon artifacts (colcon writes into the bind-mounted repo root)
 /build/
 /install/
