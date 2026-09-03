@@ -1632,8 +1632,7 @@ class PipelineViserVisualizer:
         for idx, wp in enumerate(wps):
             name = (getattr(wp, "name", "") or "").strip()
             wid = str(getattr(wp, "id", ""))
-            m = re.search(r"(\d+)\s*$", name)
-            num = int(m.group(1)) if m else idx
+            num = self._waypoint_number(name, idx)
             disp = f"#{num}"
             base = disp
             while disp in self._spot_waypoint_display_to_id:  # numbers can collide / repeat
@@ -2229,8 +2228,15 @@ class PipelineViserVisualizer:
         except Exception:
             return None
 
+    @staticmethod
+    def _waypoint_number(name: str, idx: int) -> int:
+        """Waypoint 'number': trailing digits of the name (``waypoint_38`` -> 38),
+        else the graph list index. Same scheme as the Send-to-Spot dropdown."""
+        m = re.search(r"(\d+)\s*$", str(name or "").strip())
+        return int(m.group(1)) if m else int(idx)
+
     def _nearest_waypoint(self, x: float, y: float) -> tuple[str, float] | None:
-        """(waypoint_id, planar_distance_m) of the loaded ``--walk`` graph's
+        """(``#<number>``, planar_distance_m) of the loaded ``--walk`` graph's
         nearest waypoint to (x, y) in the scene/seed frame, or None."""
         nav_graph = self._nav_graph
         if nav_graph is None:
@@ -2241,7 +2247,8 @@ class PipelineViserVisualizer:
                 return None
             d = np.hypot(wp[:, 0] - float(x), wp[:, 1] - float(y))
             k = int(np.argmin(d))
-            return str(nav_graph.waypoints[k].id), float(d[k])
+            num = self._waypoint_number(getattr(nav_graph.waypoints[k], "name", ""), k)
+            return f"#{num}", float(d[k])
         except Exception:
             return None
 
@@ -2275,7 +2282,7 @@ class PipelineViserVisualizer:
                         flag = "" if nav.navigable else " ⚠"
                         nav_str = f"nav x {nx:.2f}  y {ny:.2f}  yaw {yaw_deg:.0f}°{flag}"
                         wp = self._nearest_waypoint(nx, ny)
-                        wp_str = f"wp {wp[0]} ({wp[1]:.1f} m)" if wp is not None else ""
+                        wp_str = f"nearest waypoint {wp[0]} · {wp[1]:.1f} m" if wp is not None else ""
                     else:
                         nav_str, wp_str = "nav: n/a", ""
                     uri = self._match_thumb_uri(int(obj_id))
