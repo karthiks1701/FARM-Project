@@ -212,6 +212,20 @@ def compute_navigation_pose(
     r_start = max(required, target_reach + 0.05)
 
     def _pose(pos2: np.ndarray, clearance: float, navigable: bool, note: str) -> NavigationPose:
+        pos2 = np.asarray(pos2, dtype=np.float64).copy()
+        # Hard guarantee: the reported pose is never outside the workspace box,
+        # even on the best-effort (navigable=False) path.
+        clamped = False
+        if xmin is not None and pos2[0] < xmin:
+            pos2[0], clamped = xmin, True
+        if xmax is not None and pos2[0] > xmax:
+            pos2[0], clamped = xmax, True
+        if ymin is not None and pos2[1] < ymin:
+            pos2[1], clamped = ymin, True
+        if ymax is not None and pos2[1] > ymax:
+            pos2[1], clamped = ymax, True
+        if clamped:
+            note = note + " (clamped to workspace bounds)"
         p3 = c.copy()
         p3[horiz[0]] = float(pos2[0])
         p3[horiz[1]] = float(pos2[1])

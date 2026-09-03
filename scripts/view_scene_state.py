@@ -188,6 +188,10 @@ def main() -> int:
     parser.add_argument("--query-examples", type=Path, default=None, help="Text file with one query per line for the Query panel's Examples dropdown (default: derive examples from the scene's own captioned objects)")
     parser.add_argument("--ws-url", default=None, help="WebSocket URL of a scripts/ros_ws_bridge.py running on the robot host (e.g. ws://192.168.1.192:8765). Streams /odometry (robot pose + trail) and the color image (Live RGB panel) without ROS on this machine. --world-transform aligns the odometry like --odom-topic.")
     parser.add_argument("--ws-no-image", action="store_true", help="With --ws-url, ignore the streamed camera image (odometry only)")
+    parser.add_argument("--x-bounds", type=float, nargs=2, default=None, metavar=("XMIN", "XMAX"),
+                        help="Room walls along world X: navigation poses are kept robot_radius+clearance inside [XMIN, XMAX] and hard-clamped to it. e.g. --x-bounds 0 8")
+    parser.add_argument("--y-bounds", type=float, nargs=2, default=None, metavar=("YMIN", "YMAX"),
+                        help="Room walls along world Y for navigation poses.")
     parser.add_argument("--ws-odom-color", type=int, nargs=3, default=(236, 64, 200), metavar=("R", "G", "B"), help="RGB colour (0-255) for the WebSocket odometry trail + axes")
     parser.add_argument("--ws-odom-axes-spacing-m", type=float, default=0.5, help="Drop an orientation axes triad every this many metres along the WebSocket odometry trail")
     parser.add_argument("--ws-odom-axes-length", type=float, default=0.18, help="Length (m) of the WebSocket odometry axes triads")
@@ -242,6 +246,13 @@ def main() -> int:
         query_examples = [ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
         print(f"Loaded {len(query_examples)} query examples from {args.query_examples}")
 
+    _nav_bounds = None
+    if args.x_bounds is not None or args.y_bounds is not None:
+        xb = args.x_bounds or (None, None)
+        yb = args.y_bounds or (None, None)
+        _nav_bounds = (xb[0], xb[1], yb[0], yb[1])
+        print(f"Navigation-pose workspace bounds: x={xb}, y={yb}")
+
     visualizer = PipelineViserVisualizer(
         enabled=True,
         host=args.host,
@@ -257,6 +268,7 @@ def main() -> int:
         object_box_from_voxels=True,
         object_boxes_start_hidden=not args.show_all_boxes,
         send_to_spot_enabled=bool(args.ws_url),
+        nav_workspace_bounds=_nav_bounds,
     )
     if not visualizer.enabled:
         print("viser is not available in this environment — aborting.")

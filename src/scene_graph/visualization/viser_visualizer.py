@@ -167,6 +167,7 @@ class PipelineViserVisualizer:
         on_toggle_lock=None,
         on_add_object=None,
         send_to_spot_enabled: bool = False,
+        nav_workspace_bounds: tuple | None = None,
     ) -> None:
         self._voxel_size = float(voxel_size_m)
         self._point_size = max(1.0e-4, float(point_size_m))
@@ -228,6 +229,14 @@ class PipelineViserVisualizer:
         # "Send to Spot": relays a seed-frame navigation goal for the selected
         # query match out to a planner (set via set_send_goal_handler()).
         self._send_to_spot_enabled = bool(send_to_spot_enabled)
+        # (xmin, xmax, ymin, ymax) room walls the map has no objects for; nav
+        # poses are kept robot_radius+margin inside and hard-clamped to this box.
+        self._nav_workspace_bounds: tuple | None = None
+        if nav_workspace_bounds is not None:
+            with contextlib.suppress(Exception):
+                b = tuple(None if v is None else float(v) for v in tuple(nav_workspace_bounds)[:4])
+                if len(b) == 4 and any(v is not None for v in b):
+                    self._nav_workspace_bounds = b
         self._on_send_goal = None
         self._spot_tol_input = None
         self._spot_arm_checkbox = None
@@ -1994,8 +2003,11 @@ class PipelineViserVisualizer:
                 v = os.getenv(name, "").strip()
                 return float(v) if v not in ("", "none", "None") else None
 
-            workspace_bounds = None
-            if any(os.getenv(n) for n in ("FARM_NAV_XMIN", "FARM_NAV_XMAX", "FARM_NAV_YMIN", "FARM_NAV_YMAX")):
+            # Constructor arg wins; env is the fallback.
+            workspace_bounds = self._nav_workspace_bounds
+            if workspace_bounds is None and any(
+                os.getenv(n) for n in ("FARM_NAV_XMIN", "FARM_NAV_XMAX", "FARM_NAV_YMIN", "FARM_NAV_YMAX")
+            ):
                 workspace_bounds = (_bnd("FARM_NAV_XMIN"), _bnd("FARM_NAV_XMAX"),
                                     _bnd("FARM_NAV_YMIN"), _bnd("FARM_NAV_YMAX"))
 
