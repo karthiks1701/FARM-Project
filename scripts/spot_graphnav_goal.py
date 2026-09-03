@@ -174,8 +174,6 @@ def _navigate_to_anchor(graph_nav_client, goal_pose, tol_m: float, yaw_tol_rad: 
 
 
 def _run_goal(robot, graph_nav_client, command_client, payload: dict, args) -> None:
-    from bosdyn.api.graph_nav import graph_nav_pb2
-
     x, y, yaw = float(payload["x"]), float(payload["y"]), float(payload["yaw"])
     tol = float(payload.get("tol_m", args.default_tolerance_m))
     label = payload.get("label") or f"#{payload.get('object_id')}"
@@ -205,8 +203,38 @@ def _run_goal(robot, graph_nav_client, command_client, payload: dict, args) -> N
 
     goal_pose = _seed_tform_goal(x, y, yaw)
     yaw_tol = math.radians(args.yaw_tolerance_deg)
-    nav_id = _navigate_to_anchor(graph_nav_client, goal_pose, tol, yaw_tol)
-    deadline = time.time() + args.nav_timeout_s
+    _drive(graph_nav_client, lambda: _navigate_to_anchor(graph_nav_client, goal_pose, tol, yaw_tol),
+           args.nav_timeout_s, "navigate_to_anchor")
+
+
+def _run_waypoint_goal(robot, graph_nav_client, command_client, payload: dict, args) -> None:
+    wid = str(payload.get("waypoint_id") or args.home_waypoint or "").strip()
+    label = payload.get("label") or wid
+    if not wid:
+        print("[spot-nav] goto_waypoint with no waypoint_id and no --home-waypoint — ignored.")
+        return
+    print(f"\n[spot-nav] WAYPOINT GOAL: {label}  (id {wid})")
+    if not args.execute:
+        print(f"[spot-nav] [DRY RUN] would call navigate_to({wid!r}). Pass --execute to move.")
+        return
+    if robot.is_estopped():
+        print("[spot-nav] E-STOPPED — refusing to move. Clear the E-stop (estop_gui) and resend.")
+        return
+    if not robot.is_powered_on():
+        print("[spot-nav] powering on motors…")
+        robot.power_on(timeout_sec=20)
+    from bosdyn.client.robot_command import blocking_stand
+
+    blocking_stand(command_client, timeout_sec=10)
+    _drive(graph_nav_client, lambda: graph_nav_client.navigate_to(wid, 1.0),
+           args.nav_timeout_s, "navigate_to")
+
+
+def _drive(graph_nav_client, reissue, timeout_s: float, what: str) -> None:
+    """Re-issue the nav command on GraphNav's ~1 s watchdog and poll feedback
+    until a terminal status or a client-side timeout."""
+    from bosdyn.api.graph_nav import graph_nav_pb2
+
     terminal = {
         graph_nav_pb2.NavigationFeedbackResponse.STATUS_REACHED_GOAL: "REACHED_GOAL",
         graph_nav_pb2.NavigationFeedbackResponse.STATUS_NO_ROUTE: "NO_ROUTE",
@@ -216,15 +244,15 @@ def _run_goal(robot, graph_nav_client, command_client, payload: dict, args) -> N
         graph_nav_pb2.NavigationFeedbackResponse.STATUS_ROBOT_IMPAIRED: "ROBOT_IMPAIRED",
         graph_nav_pb2.NavigationFeedbackResponse.STATUS_COMMAND_TIMED_OUT: "COMMAND_TIMED_OUT",
     }
+    deadline = time.time() + float(timeout_s)
     while time.time() < deadline:
-        # Re-issue with the same command id so GraphNav's 1 s watchdog stays fed.
-        nav_id = _navigate_to_anchor(graph_nav_client, goal_pose, tol, yaw_tol)
+        nav_id = reissue()
         fb = graph_nav_client.navigation_feedback(nav_id)
         if fb.status in terminal:
-            print(f"[spot-nav] navigate_to_anchor -> {terminal[fb.status]}")
+            print(f"[spot-nav] {what} -> {terminal[fb.status]}")
             return
         time.sleep(0.5)
-    print("[spot-nav] navigate_to_anchor timed out (client-side).")
+    print(f"[spot-nav] {what} timed out (client-side).")
 
 
 def main() -> int:
@@ -238,6 +266,8 @@ def main() -> int:
                     help="Goal position tolerance if the viser panel sends none")
     ap.add_argument("--yaw-tolerance-deg", type=float, default=15.0)
     ap.add_argument("--nav-timeout-s", type=float, default=90.0)
+    ap.add_argument("--home-waypoint", default="",
+                    help="Waypoint id used for a 'Go to waypoint' request that carries no id.")
     ap.add_argument("--auto-localize", action="store_true",
                     help="Localize to nearest fiducial without prompting")
     ap.add_argument("--execute", action="store_true",
@@ -300,11 +330,13 @@ def main() -> int:
                         with contextlib.suppress(Exception):
                             command_client.robot_command(RobotCommandBuilder.stop_command())
                     continue
-                if kind == "goto":
-                    try:
+                try:
+                    if kind == "goto":
                         _run_goal(robot, graph_nav_client, command_client, payload, args)
-                    except Exception as exc:  # noqa: BLE001 - one bad goal must not kill the loop
-                        print(f"[spot-nav] goal failed: {exc}")
+                    elif kind == "goto_waypoint":
+                        _run_waypoint_goal(robot, graph_nav_client, command_client, payload, args)
+                except Exception as exc:  # noqa: BLE001 - one bad goal must not kill the loop
+                    print(f"[spot-nav] goal failed: {exc}")
         except KeyboardInterrupt:
             print("\n[spot-nav] Ctrl-C — releasing lease; Spot will stop and stand.")
         finally:

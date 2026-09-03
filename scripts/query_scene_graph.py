@@ -53,6 +53,10 @@ def main() -> int:
                         help="How far out from the object to search for a body-safe standoff pose.")
     parser.add_argument("--nav-up-axis", type=int, default=2, choices=(0, 1, 2),
                         help="World vertical axis (Spot/GraphNav seed frame is Z-up = 2).")
+    parser.add_argument("--x-bounds", type=float, nargs=2, default=None, metavar=("XMIN", "XMAX"),
+                        help="Workspace walls along the first horizontal axis; nav poses stay robot_radius+clearance inside them.")
+    parser.add_argument("--y-bounds", type=float, nargs=2, default=None, metavar=("YMIN", "YMAX"),
+                        help="Workspace walls along the second horizontal axis.")
     args = parser.parse_args()
 
     pt_path = Path(args.pt)
@@ -101,6 +105,11 @@ def main() -> int:
                 try:
                     from scene_graph.retrieval.navigation_pose import navigation_poses_for_scene
 
+                    _wb = None
+                    if args.x_bounds is not None or args.y_bounds is not None:
+                        xb = args.x_bounds or (None, None)
+                        yb = args.y_bounds or (None, None)
+                        _wb = (xb[0], xb[1], yb[0], yb[1])
                     nav_poses = navigation_poses_for_scene(
                         state,
                         [c.object_index for c in scored[: args.top_k]],
@@ -108,6 +117,7 @@ def main() -> int:
                         robot_radius_m=float(args.robot_radius_m),
                         search_radius_m=float(args.nav_search_radius_m),
                         up_axis=int(args.nav_up_axis),
+                        workspace_bounds=_wb,
                     )
                 except Exception as exc:  # noqa: BLE001 - nav pose is advisory
                     print(f"(navigation-pose computation skipped: {exc})\n")

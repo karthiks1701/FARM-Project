@@ -235,6 +235,10 @@ class PipelineViserVisualizer:
         self._spot_stop_button = None
         self._spot_status = None
         self._nav_by_id: dict[int, tuple[str, object]] = {}
+        self._spot_waypoint_dropdown = None
+        self._spot_waypoint_button = None
+        self._spot_waypoint_display_to_id: dict[str, str] = {}
+        self._WAYPOINT_PLACEHOLDER = "(no walk loaded)"
 
         # Handles
         self._point_handle = None
@@ -803,6 +807,7 @@ class PipelineViserVisualizer:
         self._nav_graph_visible = bool(visible)
         self._setup_nav_graph_gui()
         self._redraw_nav_graph()
+        self._populate_spot_waypoints()
 
     def _setup_nav_graph_gui(self) -> None:
         if self._nav_graph_gui_ready or self._server is None:
@@ -1493,9 +1498,25 @@ class PipelineViserVisualizer:
                     )
                 self._spot_arm_checkbox = self._gui_add_checkbox(gui, "Armed", False)
                 self._spot_send_button = self._gui_add_button(gui, "Send goal (selected match)")
+                with contextlib.suppress(Exception):
+                    self._spot_waypoint_dropdown = gui.add_dropdown(
+                        "Waypoint", options=(self._WAYPOINT_PLACEHOLDER,),
+                        initial_value=self._WAYPOINT_PLACEHOLDER,
+                    )
+                self._spot_waypoint_button = self._gui_add_button(gui, "Go to waypoint")
                 self._spot_stop_button = self._gui_add_button(gui, "STOP robot")
         except Exception:
             return
+
+        wp_btn = self._spot_waypoint_button
+        if wp_btn is not None:
+            on_click = getattr(wp_btn, "on_click", None)
+            if callable(on_click):
+                with contextlib.suppress(Exception):
+
+                    @on_click
+                    def _(_event=None):
+                        threading.Thread(target=self._handle_send_waypoint, daemon=True).start()
 
         send_btn = self._spot_send_button
         if send_btn is not None:
@@ -1577,6 +1598,75 @@ class PipelineViserVisualizer:
         with contextlib.suppress(Exception):
             self._on_send_goal({"type": "cancel"})
         self._gui_set_markdown(self._spot_status, "**STOP sent.**")
+
+    def _populate_spot_waypoints(self) -> None:
+        """Fill the 'Send to Spot' waypoint dropdown from the loaded --walk graph
+        (display = ``<name> · <id6>…``, value maps back to the full waypoint id).
+        The default (first entry) is a waypoint whose name looks like home / dock
+        / start if there is one, else the graph's first waypoint."""
+        dd = self._spot_waypoint_dropdown
+        nav_graph = self._nav_graph
+        if dd is None or nav_graph is None:
+            return
+        try:
+            wps = list(nav_graph.waypoints)
+        except Exception:
+            return
+        if not wps:
+            return
+        self._spot_waypoint_display_to_id = {}
+        options: list[str] = []
+        for wp in wps:
+            name = (getattr(wp, "name", "") or "").strip()
+            wid = str(getattr(wp, "id", ""))
+            disp = f"{name} · {wid[:6]}…" if name else (wid[:16] or "?")
+            # de-dup display strings
+            n = 2
+            base = disp
+            while disp in self._spot_waypoint_display_to_id:
+                disp = f"{base} ({n})"
+                n += 1
+            self._spot_waypoint_display_to_id[disp] = wid
+            options.append(disp)
+        home_kw = ("home", "dock", "start", "origin", "base")
+        default = next(
+            (o for o in options if any(k in o.lower() for k in home_kw)), options[0]
+        )
+        options = [default] + [o for o in options if o != default]
+        with contextlib.suppress(Exception):
+            dd.options = tuple(options)
+            dd.value = default
+        if self._spot_status is not None:
+            self._gui_set_markdown(
+                self._spot_status,
+                f"{len(options)} waypoints loaded · default **{default}**.",
+            )
+
+    def _handle_send_waypoint(self) -> None:
+        if self._on_send_goal is None:
+            self._gui_set_markdown(self._spot_status, "⚠ No planner link.")
+            return
+        armed = False
+        with contextlib.suppress(Exception):
+            armed = bool(self._spot_arm_checkbox.value)
+        if not armed:
+            self._gui_set_markdown(self._spot_status, "Tick **Armed** first, then Go to waypoint.")
+            return
+        disp = ""
+        with contextlib.suppress(Exception):
+            disp = str(self._spot_waypoint_dropdown.value)
+        wid = self._spot_waypoint_display_to_id.get(disp)
+        if not wid:
+            self._gui_set_markdown(self._spot_status, "No waypoint selected (load a --walk graph).")
+            return
+        with contextlib.suppress(Exception):
+            self._spot_arm_checkbox.value = False
+        try:
+            self._on_send_goal({"type": "goto_waypoint", "waypoint_id": wid, "label": disp})
+        except Exception as exc:  # noqa: BLE001
+            self._gui_set_markdown(self._spot_status, f"⚠ send failed: {exc}")
+            return
+        self._gui_set_markdown(self._spot_status, f"Sent → waypoint **{disp}** (`{wid[:12]}…`).")
 
     _QUERY_EXAMPLE_SKIP_CATEGORIES = frozenset(
         {"person", "warehouse", "building", "wall", "floor", "ceiling", "room", "ground", "sky"}
@@ -1900,6 +1990,15 @@ class PipelineViserVisualizer:
         with contextlib.suppress(Exception):
             from scene_graph.retrieval.navigation_pose import navigation_poses_for_scene
 
+            def _bnd(name):
+                v = os.getenv(name, "").strip()
+                return float(v) if v not in ("", "none", "None") else None
+
+            workspace_bounds = None
+            if any(os.getenv(n) for n in ("FARM_NAV_XMIN", "FARM_NAV_XMAX", "FARM_NAV_YMIN", "FARM_NAV_YMAX")):
+                workspace_bounds = (_bnd("FARM_NAV_XMIN"), _bnd("FARM_NAV_XMAX"),
+                                    _bnd("FARM_NAV_YMIN"), _bnd("FARM_NAV_YMAX"))
+
             nav_by_index = navigation_poses_for_scene(
                 state,
                 [int(c.object_index) for c in scored[:12]],
@@ -1907,6 +2006,7 @@ class PipelineViserVisualizer:
                 robot_radius_m=float(os.getenv("FARM_NAV_ROBOT_RADIUS_M", "0.6")),
                 search_radius_m=float(os.getenv("FARM_NAV_SEARCH_RADIUS_M", "2.5")),
                 up_axis=int(os.getenv("FARM_NAV_UP_AXIS", "2")),
+                workspace_bounds=workspace_bounds,
             )
 
         # `results` and the map's focus set are built from the exact same

@@ -148,6 +148,7 @@ def compute_navigation_pose(
     radial_step_m: float = 0.1,
     n_angles: int = 48,
     vertical_band_m: float = 1.5,
+    workspace_bounds: tuple | None = None,
 ) -> NavigationPose:
     """Body-safe standoff pose near object ``target_index``.
 
@@ -155,6 +156,12 @@ def compute_navigation_pose(
     come from :func:`decode_object_voxel_points`. Points owned by
     ``target_index`` are excluded from the clearance metric (we *want* to stand
     near the target); every other object's voxels are obstacles.
+
+    ``workspace_bounds`` — optional ``(xmin, xmax, ymin, ymax)`` in the two
+    horizontal axes (any entry may be ``None``). Known room walls the map does
+    NOT contain as objects: a candidate stand point is required to keep the full
+    ``robot_radius + margin`` from every set bound too, so a pose near a boundary
+    object is never placed into / through the wall.
     """
     means = np.asarray(means, dtype=np.float64)
     c = means[int(target_index)].astype(np.float64)
@@ -162,6 +169,28 @@ def compute_navigation_pose(
     horiz = [a for a in range(3) if a != up]
     c2 = c[horiz]
     required = float(robot_radius_m) + float(clearance_margin_m)
+
+    xmin = xmax = ymin = ymax = None
+    if workspace_bounds is not None:
+        try:
+            xmin, xmax, ymin, ymax = (
+                None if v is None else float(v) for v in tuple(workspace_bounds)[:4]
+            )
+        except Exception:
+            xmin = xmax = ymin = ymax = None
+
+    def _bound_clearance(cands: np.ndarray) -> np.ndarray:
+        """Signed inward distance to the nearest set workspace bound (+inf if none)."""
+        out = np.full(cands.shape[0], np.inf, dtype=np.float64)
+        if xmin is not None:
+            out = np.minimum(out, cands[:, 0] - xmin)
+        if xmax is not None:
+            out = np.minimum(out, xmax - cands[:, 0])
+        if ymin is not None:
+            out = np.minimum(out, cands[:, 1] - ymin)
+        if ymax is not None:
+            out = np.minimum(out, ymax - cands[:, 1])
+        return out
 
     pts = np.asarray(voxel_points, dtype=np.float64).reshape(-1, 3)
     owner = np.asarray(voxel_owner, dtype=np.int64).reshape(-1)
@@ -205,28 +234,29 @@ def compute_navigation_pose(
     ring = np.stack([np.cos(angles), np.sin(angles)], axis=1)  # (A, 2)
 
     if obs2.shape[0] == 0:
-        pos2 = c2 + r_start * ring[0]
-        return _pose(
-            pos2, float("inf"), True,
-            f"no other-object obstacles within range; standoff {r_start:.2f} m from target",
-        )
+        def _voxel_clearance(cands: np.ndarray) -> np.ndarray:
+            return np.full(cands.shape[0], np.inf, dtype=np.float64)
+    else:
+        try:
+            from scipy.spatial import cKDTree
 
-    try:
-        from scipy.spatial import cKDTree
+            tree = cKDTree(obs2)
 
-        tree = cKDTree(obs2)
+            def _voxel_clearance(cands: np.ndarray) -> np.ndarray:
+                d, _ = tree.query(cands, k=1)
+                return np.asarray(d, dtype=np.float64)
+        except Exception:
+            def _voxel_clearance(cands: np.ndarray) -> np.ndarray:
+                diff = cands[:, None, :] - obs2[None, :, :]
+                return np.sqrt((diff * diff).sum(-1)).min(axis=1)
 
-        def _clearance(cands: np.ndarray) -> np.ndarray:
-            d, _ = tree.query(cands, k=1)
-            return np.asarray(d, dtype=np.float64)
-    except Exception:
-        def _clearance(cands: np.ndarray) -> np.ndarray:
-            diff = cands[:, None, :] - obs2[None, :, :]
-            return np.sqrt((diff * diff).sum(-1)).min(axis=1)
+    def _clearance(cands: np.ndarray) -> np.ndarray:
+        # Effective clearance = nearest obstacle voxel OR nearest workspace wall.
+        return np.minimum(_voxel_clearance(cands), _bound_clearance(cands))
 
     radii = np.arange(r_start, r_start + float(search_radius_m) + 1e-6, float(radial_step_m))
     best_pos2: np.ndarray | None = None
-    best_clear = -1.0
+    best_clear = -1e9
     for r in radii:
         cands = c2[None, :] + r * ring  # (A, 2)
         clr = _clearance(cands)
@@ -238,19 +268,21 @@ def compute_navigation_pose(
             idx = np.where(ok)[0]
             k = idx[int(np.argmax(clr[idx]))]
             pos2 = cands[k]
+            lim = "wall" if _bound_clearance(cands[k:k + 1])[0] <= _voxel_clearance(cands[k:k + 1])[0] else "object"
             return _pose(
                 pos2, float(clr[k]), True,
                 f"standoff {r:.2f} m from target; {float(clr[k]) - required:+.2f} m past the "
-                f"{required:.2f} m body+barrier requirement "
-                f"(robot_radius {robot_radius_m:.2f} + margin {clearance_margin_m:.2f})",
+                f"{required:.2f} m body+barrier requirement (nearest limit: {lim})",
             )
 
     assert best_pos2 is not None
+    bounded = workspace_bounds is not None
     return _pose(
         best_pos2, best_clear, False,
-        f"NO body-safe pose within {search_radius_m:.1f} m of the target: best clearance "
-        f"{best_clear:.2f} m < required {required:.2f} m. Approach manually, shrink the robot "
-        f"footprint, or widen the search.",
+        f"NO body-safe pose within {search_radius_m:.1f} m of the target"
+        f"{' inside the workspace bounds' if bounded else ''}: best clearance "
+        f"{best_clear:.2f} m < required {required:.2f} m. Approach manually, shrink the "
+        f"robot footprint, widen the search, or relax the bounds.",
     )
 
 

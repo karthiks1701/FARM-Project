@@ -232,7 +232,7 @@ class RosWsClient:
             self._handle_odom(header)
         elif kind == "image" and self._want_image:
             self._handle_image(header, payload)
-        elif kind in ("goto", "cancel") and self._on_control is not None:
+        elif kind in ("goto", "goto_waypoint", "cancel") and self._on_control is not None:
             with contextlib.suppress(Exception):
                 self._on_control(header)
 

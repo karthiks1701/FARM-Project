@@ -345,7 +345,7 @@ async def _serve(args) -> None:
                     hdr = json.loads(msg[4 : 4 + hlen].decode("utf-8"))
                 except Exception:
                     continue
-                if hdr.get("type") in ("goto", "cancel"):
+                if hdr.get("type") in ("goto", "goto_waypoint", "cancel"):
                     print(f"[ros_ws_bridge] relay {hdr.get('type')}: {hdr}")
                     await _broadcast(msg, exclude=ws)
         except Exception:

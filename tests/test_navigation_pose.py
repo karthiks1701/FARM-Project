@@ -78,6 +78,47 @@ def test_no_obstacles_returns_infinite_clearance():
     assert abs(nav.position[2] - 0.5) < 1e-9
 
 
+def test_workspace_bounds_keep_pose_off_the_walls():
+    # Target hard against the x=0 wall, no mapped obstacles. Without bounds the
+    # ring search would happily stand at x<0 (inside/through the wall).
+    means = np.array([[0.3, 3.0, 0.0]], dtype=np.float64)
+    empty, own = np.zeros((0, 3)), np.zeros((0,), np.int64)
+
+    free = compute_navigation_pose(
+        0, means=means, voxel_points=empty, voxel_owner=own,
+        robot_radius_m=0.6, clearance_margin_m=0.1,
+    )
+    bounded = compute_navigation_pose(
+        0, means=means, voxel_points=empty, voxel_owner=own,
+        robot_radius_m=0.6, clearance_margin_m=0.1,
+        workspace_bounds=(0.0, 8.0, None, None),
+    )
+    assert bounded.navigable
+    # never negative, and a full robot_radius+margin (0.70 m) off the x=0 wall
+    assert bounded.position[0] >= 0.70 - 1e-6
+    assert bounded.position[0] <= 8.0
+    # a bound may also be reported as the limiting factor
+    assert "wall" in bounded.note or bounded.position[0] >= 0.70
+
+
+def test_workspace_bounds_flag_unnavigable_when_pinned():
+    # Target pinned between the x=0 wall and a shelf at x in [0.5, 6];
+    # with a short search there is no room for a 0.6 m robot -> not navigable,
+    # and the best-effort pose still respects the bounds.
+    means = np.array([[0.2, 3.0, 0.0], [3.0, 3.0, 0.0]], dtype=np.float64)
+    gx, gy = np.meshgrid(np.linspace(0.5, 6.0, 300), np.linspace(0.0, 6.0, 30))
+    obs = np.stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)], axis=1)
+    own = np.ones(obs.shape[0], np.int64)
+    nav = compute_navigation_pose(
+        0, means=means, voxel_points=obs, voxel_owner=own,
+        robot_radius_m=0.6, clearance_margin_m=0.1,
+        workspace_bounds=(0.0, 8.0, None, None), search_radius_m=1.0,
+    )
+    assert not nav.navigable
+    assert 0.0 <= nav.position[0] <= 8.0
+    assert "workspace bounds" in nav.note
+
+
 def test_self_voxels_never_count_as_obstacles():
     # Big target blob + a far obstacle: clearance is measured to the obstacle,
     # not to the target's own voxels, so the pose sits just outside the blob.
