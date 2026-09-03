@@ -49,8 +49,12 @@ def main() -> int:
                         help="Safety barrier (metres) kept between the robot footprint and any other object's voxels.")
     parser.add_argument("--robot-radius-m", type=float, default=0.6,
                         help="Robot footprint half-width (metres); the nav pose keeps robot_radius + clearance from obstacles.")
-    parser.add_argument("--nav-search-radius-m", type=float, default=2.5,
-                        help="How far out from the object to search for a body-safe standoff pose.")
+    parser.add_argument("--nav-search-radius-m", type=float, default=3.0,
+                        help="Half-extent of the grid searched around the object for a body-safe stand pose.")
+    parser.add_argument("--target-standoff-m", type=float, default=0.8,
+                        help="Preferred distance from the object's nearest part to stand.")
+    parser.add_argument("--max-target-dist-m", type=float, default=2.0,
+                        help="If the nearest body-safe pose is further than this from the object, flag it not-navigable.")
     parser.add_argument("--nav-up-axis", type=int, default=2, choices=(0, 1, 2),
                         help="World vertical axis (Spot/GraphNav seed frame is Z-up = 2).")
     parser.add_argument("--x-bounds", type=float, nargs=2, default=None, metavar=("XMIN", "XMAX"),
@@ -117,6 +121,8 @@ def main() -> int:
                         robot_radius_m=float(args.robot_radius_m),
                         search_radius_m=float(args.nav_search_radius_m),
                         up_axis=int(args.nav_up_axis),
+                        target_standoff_m=float(args.target_standoff_m),
+                        max_target_dist_m=float(args.max_target_dist_m),
                         workspace_bounds=_wb,
                     )
                 except Exception as exc:  # noqa: BLE001 - nav pose is advisory

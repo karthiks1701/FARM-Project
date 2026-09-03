@@ -2016,8 +2016,10 @@ class PipelineViserVisualizer:
                 [int(c.object_index) for c in scored[:12]],
                 clearance_margin_m=float(os.getenv("FARM_NAV_CLEARANCE_M", "0.10")),
                 robot_radius_m=float(os.getenv("FARM_NAV_ROBOT_RADIUS_M", "0.6")),
-                search_radius_m=float(os.getenv("FARM_NAV_SEARCH_RADIUS_M", "2.5")),
+                search_radius_m=float(os.getenv("FARM_NAV_SEARCH_RADIUS_M", "3.0")),
                 up_axis=int(os.getenv("FARM_NAV_UP_AXIS", "2")),
+                target_standoff_m=float(os.getenv("FARM_NAV_STANDOFF_M", "0.8")),
+                max_target_dist_m=float(os.getenv("FARM_NAV_MAX_DIST_M", "2.0")),
                 workspace_bounds=workspace_bounds,
             )
 

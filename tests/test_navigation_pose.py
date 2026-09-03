@@ -119,6 +119,33 @@ def test_workspace_bounds_flag_unnavigable_when_pinned():
     assert "workspace bounds" in nav.note
 
 
+def test_stands_close_to_an_elongated_object_not_its_bounding_radius():
+    # A ~1.6 m long "hose" centered at (7.6, -0.97); a rack of other-object
+    # voxels well away. The stand pose should hug the hose (~target_standoff
+    # from its NEAREST part), not sit a whole hose-length out from the centroid.
+    t = np.linspace(0, 3 * math.pi, 240)
+    r = 0.3 + 0.15 * t / 9.0
+    hose = np.stack([7.6 + 0.7 * np.cos(t) * r, -0.97 + 0.7 * np.sin(t) * r, np.zeros_like(t)], axis=1)
+    rack = np.stack([np.full(80, 6.0), np.linspace(-3, 0.5, 80), np.zeros(80)], axis=1)
+    pts = np.concatenate([hose, rack], axis=0)
+    own = np.concatenate([np.zeros(len(hose), int), np.ones(len(rack), int)])
+    means = np.array([[7.6, -0.97, 0.0], [6.0, -1.0, 0.0]], dtype=np.float64)
+
+    nav = compute_navigation_pose(
+        0, means=means, voxel_points=pts, voxel_owner=own,
+        robot_radius_m=0.6, clearance_margin_m=0.1, target_standoff_m=0.8,
+        workspace_bounds=(0.0, 8.0, None, None),
+    )
+    assert nav.navigable
+    # ~0.8 m from the nearest hose voxel, and comfortably closer than a full
+    # hose-length (the old ring-from-centroid behaviour put it ~3 m away).
+    assert abs(nav.offset_from_target_m - 0.8) < 0.35
+    cx, cy = nav.target_position[0], nav.target_position[1]
+    dist_to_centroid = math.hypot(nav.position[0] - cx, nav.position[1] - cy)
+    assert dist_to_centroid < 1.8
+    assert 0.0 <= nav.position[0] <= 8.0
+
+
 def test_self_voxels_never_count_as_obstacles():
     # Big target blob + a far obstacle: clearance is measured to the obstacle,
     # not to the target's own voxels, so the pose sits just outside the blob.

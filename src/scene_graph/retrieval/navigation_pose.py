@@ -144,24 +144,33 @@ def compute_navigation_pose(
     clearance_margin_m: float = _DEFAULT_CLEARANCE_MARGIN_M,
     robot_radius_m: float = _DEFAULT_ROBOT_RADIUS_M,
     up_axis: int = 2,
-    search_radius_m: float = 2.5,
-    radial_step_m: float = 0.1,
-    n_angles: int = 48,
+    search_radius_m: float = 3.0,
+    radial_step_m: float = 0.12,
+    n_angles: int = 48,  # kept for API compat; unused by the grid search
     vertical_band_m: float = 1.5,
     workspace_bounds: tuple | None = None,
+    target_standoff_m: float = 0.8,
+    min_target_standoff_m: float = 0.3,
+    max_target_dist_m: float = 2.0,
+    _shared_obstacles: tuple | None = None,
 ) -> NavigationPose:
-    """Body-safe standoff pose near object ``target_index``.
+    """Body-safe stand pose **as close as possible** to object ``target_index``.
 
     ``means`` is ``(N, 3)`` object centroids. ``voxel_points`` / ``voxel_owner``
-    come from :func:`decode_object_voxel_points`. Points owned by
-    ``target_index`` are excluded from the clearance metric (we *want* to stand
-    near the target); every other object's voxels are obstacles.
+    come from :func:`decode_object_voxel_points`.
 
-    ``workspace_bounds`` — optional ``(xmin, xmax, ymin, ymax)`` in the two
-    horizontal axes (any entry may be ``None``). Known room walls the map does
-    NOT contain as objects: a candidate stand point is required to keep the full
-    ``robot_radius + margin`` from every set bound too, so a pose near a boundary
-    object is never placed into / through the wall.
+    Grid search over the horizontal plane: a candidate is feasible when it clears
+    every *other* object's voxels and every workspace wall by
+    ``robot_radius_m + clearance_margin_m``, and is at least
+    ``min_target_standoff_m`` from the target's *own* voxels (not standing on
+    it). Among feasible candidates the one whose distance to the nearest target
+    voxel is closest to ``target_standoff_m`` wins — so the pose hugs the object
+    (its nearest reachable part, which matters for long / coiled objects like a
+    hose), not its bounding radius. ``navigable`` is False when the best feasible
+    pose is further than ``max_target_dist_m`` from the object (or none exists).
+
+    ``workspace_bounds`` — optional ``(xmin, xmax, ymin, ymax)``; any entry may
+    be ``None``. Known room walls the map has no objects for.
     """
     means = np.asarray(means, dtype=np.float64)
     c = means[int(target_index)].astype(np.float64)
@@ -198,20 +207,21 @@ def compute_navigation_pose(
         pts = np.zeros((0, 3)); owner = np.zeros((0,), np.int64)
 
     self_mask = owner == int(target_index)
-    obs_mask = ~self_mask
-    if vertical_band_m and vertical_band_m > 0.0 and pts.shape[0]:
-        obs_mask &= np.abs(pts[:, up] - c[up]) <= float(vertical_band_m)
-    obs2 = pts[obs_mask][:, horiz]
-
-    # Start the ring just outside the target's own horizontal footprint.
     self2 = pts[self_mask][:, horiz]
-    if self2.shape[0]:
-        target_reach = float(np.linalg.norm(self2 - c2[None, :], axis=1).max())
-    else:
-        target_reach = 0.0
-    r_start = max(required, target_reach + 0.05)
+    # Obstacles = every OTHER object's voxels within the vertical band. When a
+    # pre-built tree over ALL voxels is supplied (batch path), reuse it and mask
+    # out this target by owner at query time instead of rebuilding.
+    shared_tree = shared_owner = None
+    if _shared_obstacles is not None:
+        shared_tree, shared_owner = _shared_obstacles[0], _shared_obstacles[1]
+    obs2 = np.zeros((0, 2))
+    if shared_tree is None:
+        obs_mask = ~self_mask
+        if vertical_band_m and vertical_band_m > 0.0 and pts.shape[0]:
+            obs_mask &= np.abs(pts[:, up] - c[up]) <= float(vertical_band_m)
+        obs2 = pts[obs_mask][:, horiz]
 
-    def _pose(pos2: np.ndarray, clearance: float, navigable: bool, note: str) -> NavigationPose:
+    def _pose(pos2: np.ndarray, clearance: float, navigable: bool, note: str, *, target_dist: float | None = None) -> NavigationPose:
         pos2 = np.asarray(pos2, dtype=np.float64).copy()
         # Hard guarantee: the reported pose is never outside the workspace box,
         # even on the best-effort (navigable=False) path.
@@ -229,14 +239,22 @@ def compute_navigation_pose(
         p3 = c.copy()
         p3[horiz[0]] = float(pos2[0])
         p3[horiz[1]] = float(pos2[1])
-        delta = c2 - pos2
+        # Heading: face the target — its nearest own voxel if we have one,
+        # else the centroid (better for long objects than always the centroid).
+        aim = c2
+        if self2.shape[0]:
+            aim = self2[int(np.argmin(np.sum((self2 - pos2) ** 2, axis=1)))]
+        delta = aim - pos2
+        if float(delta[0] ** 2 + delta[1] ** 2) < 1e-9:
+            delta = c2 - pos2
         yaw = math.atan2(float(delta[1]), float(delta[0]))
+        off = float(target_dist) if target_dist is not None else float(np.linalg.norm(pos2 - c2))
         return NavigationPose(
             position=(float(p3[0]), float(p3[1]), float(p3[2])),
             yaw_rad=float(yaw),
             clearance_m=float(clearance),
             required_clearance_m=float(required),
-            offset_from_target_m=float(np.linalg.norm(pos2 - c2)),
+            offset_from_target_m=off,
             target_position=(float(c[0]), float(c[1]), float(c[2])),
             navigable=bool(navigable),
             note=note,
@@ -244,59 +262,82 @@ def compute_navigation_pose(
             clearance_margin_m=float(clearance_margin_m),
         )
 
-    angles = np.linspace(0.0, 2.0 * math.pi, int(max(4, n_angles)), endpoint=False)
-    ring = np.stack([np.cos(angles), np.sin(angles)], axis=1)  # (A, 2)
+    # ---- KD-trees for nearest OTHER-object voxel and nearest TARGET voxel ----
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:
+        cKDTree = None
 
-    if obs2.shape[0] == 0:
-        def _voxel_clearance(cands: np.ndarray) -> np.ndarray:
+    def _nearest(pointset: np.ndarray, cands: np.ndarray) -> np.ndarray:
+        if pointset.shape[0] == 0:
             return np.full(cands.shape[0], np.inf, dtype=np.float64)
+        if cKDTree is not None:
+            d, _ = cKDTree(pointset).query(cands, k=1)
+            return np.asarray(d, dtype=np.float64)
+        diff = cands[:, None, :] - pointset[None, :, :]
+        return np.sqrt((diff * diff).sum(-1)).min(axis=1)
+
+    # ---- candidate grid around the target centroid ----------------------
+    step = max(0.05, float(radial_step_m))
+    reach = float(search_radius_m)
+    axis = np.arange(-reach, reach + 1e-6, step)
+    gx, gy = np.meshgrid(c2[0] + axis, c2[1] + axis)
+    cands = np.stack([gx.ravel(), gy.ravel()], axis=1)
+
+    if shared_tree is not None:
+        # k-NN against the shared all-voxel tree, drop this target's own voxels.
+        k = min(48, shared_owner.shape[0])
+        dd, ii = shared_tree.query(cands, k=k)
+        dd = np.atleast_2d(dd); ii = np.atleast_2d(ii)
+        same = shared_owner[ii] == int(target_index)
+        dd_obs = np.where(same, np.inf, dd)
+        d_obs = dd_obs.min(axis=1)
     else:
-        try:
-            from scipy.spatial import cKDTree
+        d_obs = _nearest(obs2, cands)
+    d_wall = _bound_clearance(cands)
+    d_self = _nearest(self2, cands) if self2.shape[0] else np.linalg.norm(cands - c2[None, :], axis=1)
+    body_clear = np.minimum(d_obs, d_wall)
 
-            tree = cKDTree(obs2)
-
-            def _voxel_clearance(cands: np.ndarray) -> np.ndarray:
-                d, _ = tree.query(cands, k=1)
-                return np.asarray(d, dtype=np.float64)
-        except Exception:
-            def _voxel_clearance(cands: np.ndarray) -> np.ndarray:
-                diff = cands[:, None, :] - obs2[None, :, :]
-                return np.sqrt((diff * diff).sum(-1)).min(axis=1)
-
-    def _clearance(cands: np.ndarray) -> np.ndarray:
-        # Effective clearance = nearest obstacle voxel OR nearest workspace wall.
-        return np.minimum(_voxel_clearance(cands), _bound_clearance(cands))
-
-    radii = np.arange(r_start, r_start + float(search_radius_m) + 1e-6, float(radial_step_m))
-    best_pos2: np.ndarray | None = None
-    best_clear = -1e9
-    for r in radii:
-        cands = c2[None, :] + r * ring  # (A, 2)
-        clr = _clearance(cands)
-        j = int(np.argmax(clr))
-        if clr[j] > best_clear:
-            best_clear, best_pos2 = float(clr[j]), cands[j]
-        ok = clr >= required
-        if np.any(ok):
-            idx = np.where(ok)[0]
-            k = idx[int(np.argmax(clr[idx]))]
-            pos2 = cands[k]
-            lim = "wall" if _bound_clearance(cands[k:k + 1])[0] <= _voxel_clearance(cands[k:k + 1])[0] else "object"
-            return _pose(
-                pos2, float(clr[k]), True,
-                f"standoff {r:.2f} m from target; {float(clr[k]) - required:+.2f} m past the "
-                f"{required:.2f} m body+barrier requirement (nearest limit: {lim})",
+    feasible = (body_clear >= required) & (d_self >= float(min_target_standoff_m))
+    if np.any(feasible):
+        idx = np.where(feasible)[0]
+        # closest feasible pose to the object, biased toward `target_standoff_m`
+        cost = np.abs(d_self[idx] - float(target_standoff_m))
+        k = idx[int(np.argmin(cost))]
+        td = float(d_self[k])
+        navigable = td <= float(max_target_dist_m)
+        note = (
+            f"stand {td:.2f} m from the object (nearest part), "
+            f"{float(body_clear[k]) - required:+.2f} m past the {required:.2f} m body+barrier"
+        )
+        if not navigable:
+            note = (
+                f"nearest body-safe pose is {td:.2f} m from the object "
+                f"(> {max_target_dist_m:.1f} m) — it is boxed in by other objects/walls"
             )
+        return _pose(cands[k], float(body_clear[k]), navigable, note, target_dist=td)
 
-    assert best_pos2 is not None
+    # Nothing satisfies the self-standoff; relax it (allow the object's edge)
+    relaxed = body_clear >= required
+    if np.any(relaxed):
+        idx = np.where(relaxed)[0]
+        k = idx[int(np.argmin(d_self[idx]))]
+        return _pose(
+            cands[k], float(body_clear[k]), False,
+            f"only pose clear of other objects/walls is on the target's own footprint "
+            f"({float(d_self[k]):.2f} m from it) — approach on foot",
+            target_dist=float(d_self[k]),
+        )
+
+    # Best effort: maximise body clearance
+    k = int(np.argmax(body_clear))
     bounded = workspace_bounds is not None
     return _pose(
-        best_pos2, best_clear, False,
-        f"NO body-safe pose within {search_radius_m:.1f} m of the target"
+        cands[k], float(body_clear[k]), False,
+        f"NO body-safe pose near the target"
         f"{' inside the workspace bounds' if bounded else ''}: best clearance "
-        f"{best_clear:.2f} m < required {required:.2f} m. Approach manually, shrink the "
-        f"robot footprint, widen the search, or relax the bounds.",
+        f"{float(body_clear[k]):.2f} m < required {required:.2f} m.",
+        target_dist=float(d_self[k]),
     )
 
 
@@ -312,11 +353,27 @@ def navigation_poses_for_scene(
     """
     means = _to_numpy(state.get("means")).astype(np.float64)
     pts, owner = decode_object_voxel_points(state)
+
+    # Build one KD-tree over every object's voxels; each target reuses it and
+    # masks out its own points by owner (rebuilding a ~10^5-point tree per
+    # target was the bottleneck for interactive queries).
+    shared = None
+    up = int(kwargs.get("up_axis", 2)) % 3
+    horiz = [a for a in range(3) if a != up]
+    if pts.shape[0]:
+        try:
+            from scipy.spatial import cKDTree
+
+            shared = (cKDTree(np.ascontiguousarray(pts[:, horiz])), owner)
+        except Exception:
+            shared = None
+
     out: dict[int, NavigationPose] = {}
     for i in target_indices:
         i = int(i)
         if 0 <= i < means.shape[0]:
             out[i] = compute_navigation_pose(
-                i, means=means, voxel_points=pts, voxel_owner=owner, **kwargs
+                i, means=means, voxel_points=pts, voxel_owner=owner,
+                _shared_obstacles=shared, **kwargs
             )
     return out
