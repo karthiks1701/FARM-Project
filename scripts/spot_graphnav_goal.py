@@ -207,11 +207,34 @@ def _run_goal(robot, graph_nav_client, command_client, payload: dict, args) -> N
            args.nav_timeout_s, "navigate_to_anchor")
 
 
-def _run_waypoint_goal(robot, graph_nav_client, command_client, payload: dict, args) -> None:
-    wid = str(payload.get("waypoint_id") or args.home_waypoint or "").strip()
+def _resolve_waypoint(graph, token: str) -> str:
+    """Map a token to a full GraphNav waypoint id. Accepts the id itself, a bare
+    number ``38`` / ``#38`` (matched against a trailing number in each waypoint's
+    name, else the list index), or empty -> ''."""
+    token = str(token or "").strip().lstrip("#")
+    if not token or graph is None:
+        return token
+    ids = [wp.id for wp in graph.waypoints]
+    if token in ids:
+        return token
+    if token.isdigit():
+        import re as _re
+
+        n = int(token)
+        for wp in graph.waypoints:
+            m = _re.search(r"(\d+)\s*$", (wp.annotations.name or ""))
+            if m and int(m.group(1)) == n:
+                return wp.id
+        if 0 <= n < len(ids):
+            return ids[n]
+    return token
+
+
+def _run_waypoint_goal(robot, graph_nav_client, command_client, payload: dict, args, graph=None) -> None:
+    wid = _resolve_waypoint(graph, payload.get("waypoint_id") or args.home_waypoint or "")
     label = payload.get("label") or wid
     if not wid:
-        print("[spot-nav] goto_waypoint with no waypoint_id and no --home-waypoint — ignored.")
+        print("[spot-nav] goto_waypoint with no waypoint_id/number and no --home-waypoint — ignored.")
         return
     print(f"\n[spot-nav] WAYPOINT GOAL: {label}  (id {wid})")
     if not args.execute:
@@ -267,7 +290,7 @@ def main() -> int:
     ap.add_argument("--yaw-tolerance-deg", type=float, default=15.0)
     ap.add_argument("--nav-timeout-s", type=float, default=90.0)
     ap.add_argument("--home-waypoint", default="",
-                    help="Waypoint id used for a 'Go to waypoint' request that carries no id.")
+                    help="Waypoint id OR number (e.g. 38) used when a request carries none.")
     ap.add_argument("--auto-localize", action="store_true",
                     help="Localize to nearest fiducial without prompting")
     ap.add_argument("--execute", action="store_true",
@@ -312,7 +335,7 @@ def main() -> int:
     print(f"[spot-nav] mode: {mode}")
 
     with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
-        _upload_graph(graph_nav_client, args.graph_path)
+        graph = _upload_graph(graph_nav_client, args.graph_path)
         _localize(graph_nav_client, auto=args.auto_localize)
         print(f"[spot-nav] waiting for goals on {args.ws_url}  (Ctrl-C to stop)")
         try:
@@ -334,7 +357,7 @@ def main() -> int:
                     if kind == "goto":
                         _run_goal(robot, graph_nav_client, command_client, payload, args)
                     elif kind == "goto_waypoint":
-                        _run_waypoint_goal(robot, graph_nav_client, command_client, payload, args)
+                        _run_waypoint_goal(robot, graph_nav_client, command_client, payload, args, graph=graph)
                 except Exception as exc:  # noqa: BLE001 - one bad goal must not kill the loop
                     print(f"[spot-nav] goal failed: {exc}")
         except KeyboardInterrupt:

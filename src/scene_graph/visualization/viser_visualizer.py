@@ -1609,10 +1609,13 @@ class PipelineViserVisualizer:
         self._gui_set_markdown(self._spot_status, "**STOP sent.**")
 
     def _populate_spot_waypoints(self) -> None:
-        """Fill the 'Send to Spot' waypoint dropdown from the loaded --walk graph
-        (display = ``<name> · <id6>…``, value maps back to the full waypoint id).
-        The default (first entry) is a waypoint whose name looks like home / dock
-        / start if there is one, else the graph's first waypoint."""
+        """Fill the 'Send to Spot' waypoint dropdown from the loaded --walk graph.
+
+        Entries are **waypoint numbers** — ``#<N>`` where N is the trailing
+        number of the waypoint's name (``waypoint_38`` -> 38), falling back to
+        the graph list index. The dropdown value maps back to the full GraphNav
+        waypoint id that is actually sent. Default = a home/dock/start-named
+        waypoint if any, else the lowest number."""
         dd = self._spot_waypoint_dropdown
         nav_graph = self._nav_graph
         if dd is None or nav_graph is None:
@@ -1624,23 +1627,26 @@ class PipelineViserVisualizer:
         if not wps:
             return
         self._spot_waypoint_display_to_id = {}
-        options: list[str] = []
-        for wp in wps:
+        rows: list[tuple[int, str, bool]] = []  # (number, display, is_home)
+        home_kw = ("home", "dock", "start", "origin", "base")
+        for idx, wp in enumerate(wps):
             name = (getattr(wp, "name", "") or "").strip()
             wid = str(getattr(wp, "id", ""))
-            disp = f"{name} · {wid[:6]}…" if name else (wid[:16] or "?")
-            # de-dup display strings
-            n = 2
+            m = re.search(r"(\d+)\s*$", name)
+            num = int(m.group(1)) if m else idx
+            disp = f"#{num}"
             base = disp
-            while disp in self._spot_waypoint_display_to_id:
-                disp = f"{base} ({n})"
-                n += 1
+            while disp in self._spot_waypoint_display_to_id:  # numbers can collide / repeat
+                disp = f"{base} ({wid[:4]})" if base == disp else f"{base}·{wid[:4]}"
+                if disp in self._spot_waypoint_display_to_id:
+                    disp = f"{base}·{idx}"
+                break
             self._spot_waypoint_display_to_id[disp] = wid
-            options.append(disp)
-        home_kw = ("home", "dock", "start", "origin", "base")
-        default = next(
-            (o for o in options if any(k in o.lower() for k in home_kw)), options[0]
-        )
+            rows.append((num, disp, bool(name) and any(k in name.lower() for k in home_kw)))
+
+        rows.sort(key=lambda r: r[0])
+        options = [r[1] for r in rows]
+        default = next((r[1] for r in rows if r[2]), options[0])
         options = [default] + [o for o in options if o != default]
         with contextlib.suppress(Exception):
             dd.options = tuple(options)
@@ -1648,7 +1654,7 @@ class PipelineViserVisualizer:
         if self._spot_status is not None:
             self._gui_set_markdown(
                 self._spot_status,
-                f"{len(options)} waypoints loaded · default **{default}**.",
+                f"{len(options)} waypoints (by number) · default **{default}**.",
             )
 
     def _handle_send_waypoint(self) -> None:
