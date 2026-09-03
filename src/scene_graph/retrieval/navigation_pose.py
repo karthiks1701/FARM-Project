@@ -9,7 +9,7 @@ horizontally outside every *other* object's voxel evidence by at least
     required_clearance = robot_radius_m + clearance_margin_m
 
 where ``clearance_margin_m`` is a small safety barrier (a few centimetres) and
-``robot_radius_m`` is the robot footprint half-width (Spot ~0.5 m). The search is
+``robot_radius_m`` is the robot footprint half-width (Spot ~0.6 m). The search is
 a widening ring of candidate stand points around the target on the horizontal
 plane; the nearest ring slot that clears the requirement wins, and the heading
 faces the target. If nothing within ``search_radius_m`` clears the body+barrier
@@ -30,7 +30,7 @@ import numpy as np
 from scene_graph.utils.geometry import decode_voxel_keys_numpy
 
 _DEFAULT_CLEARANCE_MARGIN_M = 0.10
-_DEFAULT_ROBOT_RADIUS_M = 0.5
+_DEFAULT_ROBOT_RADIUS_M = 0.6
 
 
 def _to_numpy(value) -> np.ndarray:

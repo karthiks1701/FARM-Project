@@ -256,6 +256,7 @@ def main() -> int:
         object_voxel_max_points_per_object=max(0, args.voxel_points_per_object),
         object_box_from_voxels=True,
         object_boxes_start_hidden=not args.show_all_boxes,
+        send_to_spot_enabled=bool(args.ws_url),
     )
     if not visualizer.enabled:
         print("viser is not available in this environment — aborting.")
@@ -371,10 +372,25 @@ def main() -> int:
                 want_image=not args.ws_no_image,
             )
             ws_client.start()
+
+            def _send_goal(payload: dict) -> None:
+                ok = ws_client.send(payload)
+                kind = payload.get("type")
+                if kind == "goto":
+                    print(
+                        f"[send-to-spot] {'sent' if ok else 'NOT SENT (offline)'} goal "
+                        f"#{payload.get('object_id')} x={payload.get('x'):.2f} "
+                        f"y={payload.get('y'):.2f} yaw={payload.get('yaw'):.3f} "
+                        f"tol={payload.get('tol_m')}"
+                    )
+                else:
+                    print(f"[send-to-spot] {'sent' if ok else 'NOT SENT'} {kind}")
+
+            visualizer.set_send_goal_handler(_send_goal)
             print(
                 f"Connecting to ROS bridge {args.ws_url} — robot pose + trail"
                 + ("" if args.ws_no_image else " + Live RGB panel")
-                + " will stream in."
+                + "; 'Send to Spot' panel active."
             )
         except Exception as exc:  # noqa: BLE001 - stream is optional context
             print(f"Could not start WebSocket client ({exc}); continuing without it.")

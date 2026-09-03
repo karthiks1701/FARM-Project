@@ -166,6 +166,7 @@ class PipelineViserVisualizer:
         on_save_all=None,
         on_toggle_lock=None,
         on_add_object=None,
+        send_to_spot_enabled: bool = False,
     ) -> None:
         self._voxel_size = float(voxel_size_m)
         self._point_size = max(1.0e-4, float(point_size_m))
@@ -223,6 +224,17 @@ class PipelineViserVisualizer:
         self._on_save_all = on_save_all
         self._on_toggle_lock = on_toggle_lock
         self._on_add_object = on_add_object
+
+        # "Send to Spot": relays a seed-frame navigation goal for the selected
+        # query match out to a planner (set via set_send_goal_handler()).
+        self._send_to_spot_enabled = bool(send_to_spot_enabled)
+        self._on_send_goal = None
+        self._spot_tol_input = None
+        self._spot_arm_checkbox = None
+        self._spot_send_button = None
+        self._spot_stop_button = None
+        self._spot_status = None
+        self._nav_by_id: dict[int, tuple[str, object]] = {}
 
         # Handles
         self._point_handle = None
@@ -323,11 +335,9 @@ class PipelineViserVisualizer:
         self._live_odom_size_slider = None
         self._query_pose_handles: list = []
         self._query_pose_count: int = 0
-        # Collision-aware navigation-pose markers drawn in the 3D scene after a
-        # query (footprint ring + heading + connector to the object centre).
-        self._nav_pose_handles: list = []
-        self._nav_pose_show: bool = False
-        self._nav_pose_show_checkbox = None
+        # Latest query results, kept for the "Send to Spot" panel. The
+        # collision-aware standoff pose per match is shown as x / y / yaw text
+        # under each match — no 3D markers.
         self._last_query_results: list | None = None
         self._latest_scene_state: dict | None = None
         self._latest_poses: Sequence[torch.Tensor | np.ndarray] = []
@@ -473,6 +483,7 @@ class PipelineViserVisualizer:
         self._setup_filter_gui()
         self._setup_query_gui()
         self._setup_edit_gui()
+        self._setup_send_to_spot_gui()
 
     @property
     def enabled(self) -> bool:
@@ -1394,9 +1405,6 @@ class PipelineViserVisualizer:
                 self._query_input = self._gui_add_text(gui, "Query", initial="")
                 self._query_search_button = self._gui_add_button(gui, "Search")
                 self._reset_button = self._gui_add_button(gui, "Reset view")
-                self._nav_pose_show_checkbox = self._gui_add_checkbox(
-                    gui, "Show navigation poses", self._nav_pose_show
-                )
                 self._query_results_display = gui.add_markdown("")
                 with contextlib.suppress(Exception):
                     self._query_matches_folder = gui.add_folder("Top matches")
@@ -1452,20 +1460,123 @@ class PipelineViserVisualizer:
                     def _(_event=None):
                         self._reset_view()
 
-        nav_cb = self._nav_pose_show_checkbox
-        if nav_cb is not None:
-            on_update = getattr(nav_cb, "on_update", None)
-            if callable(on_update):
+    # ------------------------------------------------------------------
+    # Send to Spot
+    # ------------------------------------------------------------------
+    def set_send_goal_handler(self, fn) -> None:
+        """Install the callback that ships a navigation goal to a planner.
+
+        ``fn(payload: dict)`` — for a goal, ``{"type":"goto","object_id","label",
+        "x","y","yaw","tol_m","navigable"}`` (seed frame); for a stop,
+        ``{"type":"cancel"}``. Wired only when ``send_to_spot_enabled=True``.
+        """
+        self._on_send_goal = fn
+        if self._spot_status is not None:
+            self._gui_set_markdown(self._spot_status, "Ready. Select a match, arm, send.")
+
+    def _setup_send_to_spot_gui(self) -> None:
+        if not self._send_to_spot_enabled or self._server is None:
+            return
+        gui = getattr(self._server, "gui", None)
+        if gui is None:
+            return
+        try:
+            with gui.add_folder("Send to Spot"):
+                self._spot_status = gui.add_markdown("_Waiting for planner link…_")
+                try:
+                    self._spot_tol_input = gui.add_number(
+                        "Goal tolerance (m)", initial_value=0.25, min=0.05, max=2.0, step=0.05
+                    )
+                except Exception:
+                    self._spot_tol_input = self._gui_add_slider(
+                        gui, "Goal tolerance (m)", min_v=0.05, max_v=2.0, step=0.05, initial=0.25
+                    )
+                self._spot_arm_checkbox = self._gui_add_checkbox(gui, "Armed", False)
+                self._spot_send_button = self._gui_add_button(gui, "Send goal (selected match)")
+                self._spot_stop_button = self._gui_add_button(gui, "STOP robot")
+        except Exception:
+            return
+
+        send_btn = self._spot_send_button
+        if send_btn is not None:
+            on_click = getattr(send_btn, "on_click", None)
+            if callable(on_click):
                 with contextlib.suppress(Exception):
 
-                    @on_update
+                    @on_click
                     def _(_event=None):
-                        with contextlib.suppress(Exception):
-                            self._nav_pose_show = bool(nav_cb.value)
-                        if self._nav_pose_show:
-                            self._draw_navigation_poses(self._last_query_results)
-                        else:
-                            self._clear_navigation_poses()
+                        threading.Thread(target=self._handle_send_goal, daemon=True).start()
+
+        stop_btn = self._spot_stop_button
+        if stop_btn is not None:
+            on_click = getattr(stop_btn, "on_click", None)
+            if callable(on_click):
+                with contextlib.suppress(Exception):
+
+                    @on_click
+                    def _(_event=None):
+                        threading.Thread(target=self._handle_stop_robot, daemon=True).start()
+
+    def _selected_goal_payload(self) -> dict | None:
+        oid = self._selected_object_id
+        if oid is None or oid not in self._nav_by_id:
+            return None
+        label, nav = self._nav_by_id[int(oid)]
+        if nav is None:
+            return None
+        try:
+            tol = float(getattr(self._spot_tol_input, "value", 0.25))
+        except Exception:
+            tol = 0.25
+        nx, ny, _nz = nav.position
+        return {
+            "type": "goto",
+            "object_id": int(oid),
+            "label": str(label or ""),
+            "x": float(nx),
+            "y": float(ny),
+            "yaw": float(nav.yaw_rad),
+            "tol_m": max(0.05, tol),
+            "navigable": bool(getattr(nav, "navigable", False)),
+        }
+
+    def _handle_send_goal(self) -> None:
+        if self._on_send_goal is None:
+            self._gui_set_markdown(self._spot_status, "⚠ No planner link.")
+            return
+        armed = False
+        with contextlib.suppress(Exception):
+            armed = bool(self._spot_arm_checkbox.value)
+        if not armed:
+            self._gui_set_markdown(self._spot_status, "Tick **Armed** first, then Send.")
+            return
+        payload = self._selected_goal_payload()
+        if payload is None:
+            self._gui_set_markdown(
+                self._spot_status,
+                "Select a match first (click its box or a number under **Top matches**).",
+            )
+            return
+        with contextlib.suppress(Exception):
+            self._spot_arm_checkbox.value = False  # disarm after every send
+        try:
+            self._on_send_goal(payload)
+        except Exception as exc:  # noqa: BLE001
+            self._gui_set_markdown(self._spot_status, f"⚠ send failed: {exc}")
+            return
+        warn = "" if payload["navigable"] else " ⚠ pose flagged not-navigable"
+        self._gui_set_markdown(
+            self._spot_status,
+            f"Sent #{payload['object_id']} → x {payload['x']:.2f}, y {payload['y']:.2f}, "
+            f"yaw {math.degrees(payload['yaw']):.0f}°, tol {payload['tol_m']:.2f} m.{warn}",
+        )
+
+    def _handle_stop_robot(self) -> None:
+        if self._on_send_goal is None:
+            return
+        with contextlib.suppress(Exception):
+            self._on_send_goal({"type": "cancel"})
+        self._gui_set_markdown(self._spot_status, "**STOP sent.**")
 
     _QUERY_EXAMPLE_SKIP_CATEGORIES = frozenset(
         {"person", "warehouse", "building", "wall", "floor", "ceiling", "room", "ground", "sky"}
@@ -1793,7 +1904,7 @@ class PipelineViserVisualizer:
                 state,
                 [int(c.object_index) for c in scored[:12]],
                 clearance_margin_m=float(os.getenv("FARM_NAV_CLEARANCE_M", "0.10")),
-                robot_radius_m=float(os.getenv("FARM_NAV_ROBOT_RADIUS_M", "0.5")),
+                robot_radius_m=float(os.getenv("FARM_NAV_ROBOT_RADIUS_M", "0.6")),
                 search_radius_m=float(os.getenv("FARM_NAV_SEARCH_RADIUS_M", "2.5")),
                 up_axis=int(os.getenv("FARM_NAV_UP_AXIS", "2")),
             )
@@ -1959,12 +2070,18 @@ class PipelineViserVisualizer:
         self._query_roles = roles
         self._apply_focus(focus_ids)
 
-        # Draw the collision-aware navigation pose for every match in the 3D
-        # scene: a footprint ring + heading arrow + a connector to the object
-        # centre (green = body-safe, red = no safe pose found).
+        # Kept for the "Send to Spot" panel; the standoff pose per match is
+        # shown as x / y / yaw text in the Top-matches grid, no 3D markers.
         self._last_query_results = results
-        if self._nav_pose_show:
-            self._draw_navigation_poses(results)
+        self._nav_by_id = {
+            int(obj_id): (str(caption or ""), nav)
+            for (obj_id, _score, caption, _pos, nav) in results
+        }
+        if self._spot_status is not None and self._on_send_goal is not None:
+            self._gui_set_markdown(
+                self._spot_status,
+                f"{len(self._nav_by_id)} matches. Select one, tick **Armed**, **Send goal**.",
+            )
 
 
     def _match_thumb_uri(self, obj_id: int) -> str | None:
@@ -1992,10 +2109,28 @@ class PipelineViserVisualizer:
         except Exception:
             return None
 
+    def _nearest_waypoint(self, x: float, y: float) -> tuple[str, float] | None:
+        """(waypoint_id, planar_distance_m) of the loaded ``--walk`` graph's
+        nearest waypoint to (x, y) in the scene/seed frame, or None."""
+        nav_graph = self._nav_graph
+        if nav_graph is None:
+            return None
+        try:
+            wp = np.asarray(nav_graph.waypoint_positions(), dtype=np.float64).reshape(-1, 3)
+            if wp.shape[0] == 0:
+                return None
+            d = np.hypot(wp[:, 0] - float(x), wp[:, 1] - float(y))
+            k = int(np.argmin(d))
+            return str(nav_graph.waypoints[k].id), float(d[k])
+        except Exception:
+            return None
+
     def _render_top_matches(self, results: list) -> None:
         """(Re)build the 'Top matches' section: a 3-wide grid (up to 12) of
-        object thumbnails with a big rank number + position, plus a button
-        group that isolates a single match's box."""
+        object thumbnails with a big rank number, the object centre, and the
+        collision-aware navigation goal (seed-frame x / y / yaw, + nearest
+        ``--walk`` waypoint id when a walk is loaded), plus a button group that
+        isolates a single match's box."""
         gui = getattr(self._server, "gui", None) if self._server is not None else None
         folder = self._query_matches_folder
         if gui is None or folder is None:
@@ -2012,8 +2147,17 @@ class PipelineViserVisualizer:
                 cells = []
                 for rank, (obj_id, score, caption, pos, nav) in enumerate(top, start=1):
                     pos_str = (
-                        f"{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}" if pos is not None else "no pos"
+                        f"obj {pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}" if pos is not None else "obj: no pos"
                     )
+                    if nav is not None:
+                        nx, ny, _nz = nav.position
+                        yaw_deg = math.degrees(nav.yaw_rad)
+                        flag = "" if nav.navigable else " ⚠"
+                        nav_str = f"nav x {nx:.2f}  y {ny:.2f}  yaw {yaw_deg:.0f}°{flag}"
+                        wp = self._nearest_waypoint(nx, ny)
+                        wp_str = f"wp {wp[0]} ({wp[1]:.1f} m)" if wp is not None else ""
+                    else:
+                        nav_str, wp_str = "nav: n/a", ""
                     uri = self._match_thumb_uri(int(obj_id))
                     if uri:
                         img = (
@@ -2030,7 +2174,9 @@ class PipelineViserVisualizer:
                         + img
                         + f"<div style='font-size:1.7em;font-weight:800;line-height:1.15'>{rank}"
                         + f"<span style='font-size:.42em;font-weight:400;opacity:.6'> #{obj_id}</span></div>"
-                        + f"<div style='font-size:.82em;opacity:.75'>{pos_str}</div>"
+                        + f"<div style='font-size:.78em;opacity:.6'>{pos_str}</div>"
+                        + f"<div style='font-size:.82em;opacity:.9;font-weight:600'>{nav_str}</div>"
+                        + (f"<div style='font-size:.75em;opacity:.6'>{wp_str}</div>" if wp_str else "")
                         + "</div>"
                     )
                 grid = (
@@ -2110,8 +2256,6 @@ class PipelineViserVisualizer:
             with contextlib.suppress(Exception):
                 handle.remove()
         self._query_pose_handles = []
-        # Remove the navigation-pose markers.
-        self._clear_navigation_poses()
         self._last_query_results = None
         # Wipe the accumulated live-odometry trail (+ the red /robot_trajectory)
         # so the path restarts from the next incoming pose.
@@ -2129,114 +2273,6 @@ class PipelineViserVisualizer:
             for client in clients.values():
                 self._try_set_camera(client, position=home[0], look_at=home[1], up=self._home_up)
         self._gui_set_markdown(self._query_results_display, "_View reset._")
-
-    # ------------------------------------------------------------------
-    # Navigation-pose markers (drawn in the 3D scene on query)
-    # ------------------------------------------------------------------
-    def _clear_navigation_poses(self) -> None:
-        for handle in self._nav_pose_handles:
-            with contextlib.suppress(Exception):
-                handle.remove()
-        self._nav_pose_handles = []
-        with contextlib.suppress(Exception):
-            if self._server is not None:
-                self._server.flush()
-
-    @staticmethod
-    def _horiz_ring_segments(center: np.ndarray, radius: float, up: int, n: int = 48) -> np.ndarray:
-        horiz = [a for a in range(3) if a != up]
-        ang = np.linspace(0.0, 2.0 * np.pi, int(max(6, n)), endpoint=False)
-        pts = np.tile(np.asarray(center, dtype=np.float32).reshape(3), (ang.shape[0], 1))
-        pts[:, horiz[0]] += float(radius) * np.cos(ang).astype(np.float32)
-        pts[:, horiz[1]] += float(radius) * np.sin(ang).astype(np.float32)
-        return np.stack([pts, np.roll(pts, -1, axis=0)], axis=1)
-
-    def _draw_navigation_poses(self, results: list | None, *, max_markers: int = 10) -> None:
-        """Draw one navigation-pose marker per query match: a robot-footprint
-        ring + heading arrow at the standoff pose, plus a thin link to the
-        object centre. Green = body-safe, red = no safe pose was found."""
-        self._clear_navigation_poses()
-        if self._server is None or not self._nav_pose_show or not results:
-            return
-        up = int(os.getenv("FARM_NAV_UP_AXIS", "2")) % 3
-        horiz = [a for a in range(3) if a != up]
-        appended = 0
-        with contextlib.suppress(Exception):
-            with self._server.atomic():
-                for entry in results[:max_markers]:
-                    try:
-                        obj_id, _score, _caption, pos, nav = entry
-                    except Exception:
-                        continue
-                    if nav is None:
-                        continue
-                    p = np.asarray(nav.position, dtype=np.float32).reshape(3)
-                    if not np.all(np.isfinite(p)):
-                        continue
-                    radius = float(getattr(nav, "robot_radius_m", 0.5)) or 0.5
-                    ok = bool(getattr(nav, "navigable", False))
-                    color = (60, 200, 100) if ok else (235, 90, 60)
-                    base = f"/nav_pose/{int(obj_id)}"
-
-                    ring = self._horiz_ring_segments(p, radius, up)
-                    self._nav_pose_handles.append(
-                        self._server.scene.add_line_segments(
-                            f"{base}/footprint",
-                            points=ring,
-                            colors=np.tile(np.array(color, np.uint8), (ring.shape[0], 2, 1)),
-                            line_width=3.0,
-                        )
-                    )
-
-                    heading = p.copy()
-                    heading[horiz[0]] += radius * 1.5 * float(np.cos(nav.yaw_rad))
-                    heading[horiz[1]] += radius * 1.5 * float(np.sin(nav.yaw_rad))
-                    self._nav_pose_handles.append(
-                        self._server.scene.add_line_segments(
-                            f"{base}/heading",
-                            points=np.stack([p, heading], axis=0)[None, ...],
-                            colors=np.tile(np.array(color, np.uint8), (1, 2, 1)),
-                            line_width=5.0,
-                        )
-                    )
-
-                    if pos is not None:
-                        obj_c = np.asarray(pos, dtype=np.float32).reshape(3)
-                        if np.all(np.isfinite(obj_c)):
-                            self._nav_pose_handles.append(
-                                self._server.scene.add_line_segments(
-                                    f"{base}/link",
-                                    points=np.stack([p, obj_c], axis=0)[None, ...],
-                                    colors=np.full((1, 2, 3), 180, np.uint8),
-                                    line_width=1.5,
-                                )
-                            )
-
-                    with contextlib.suppress(Exception):
-                        self._nav_pose_handles.append(
-                            self._server.scene.add_icosphere(
-                                f"{base}/dot", radius=max(0.05, radius * 0.12),
-                                subdivisions=2,
-                                position=(float(p[0]), float(p[1]), float(p[2])),
-                                color=color, opacity=0.95,
-                            )
-                        )
-                    with contextlib.suppress(Exception):
-                        lp = p.copy()
-                        lp[up] += 0.2
-                        txt = (
-                            f"#{int(obj_id)} nav {nav.clearance_m:.2f}m"
-                            if ok else f"#{int(obj_id)} ⚠ no safe pose ({nav.clearance_m:.2f}m)"
-                        )
-                        self._nav_pose_handles.append(
-                            self._server.scene.add_label(
-                                f"{base}/label", text=txt,
-                                position=(float(lp[0]), float(lp[1]), float(lp[2])),
-                            )
-                        )
-                    appended += 1
-            self._server.flush()
-        LOGGER.info("Drew %d navigation-pose marker(s)", appended)
 
     def _jump_to_object_id(self, target_id: int) -> None:
         """Highlight object *target_id* and fly the camera to it."""

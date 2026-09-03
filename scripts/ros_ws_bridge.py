@@ -311,27 +311,48 @@ async def _serve(args) -> None:
     odom_q: asyncio.Queue = asyncio.Queue(maxsize=64)
     img_slot = _LatestSlot()
 
-    async def _handler(ws, *_compat) -> None:  # *_compat: legacy websockets passes a path arg
-        clients.add(ws)
-        peer = getattr(ws, "remote_address", None)
-        print(f"[ros_ws_bridge] client connected: {peer} ({len(clients)} total)")
-        try:
-            await ws.wait_closed()
-        finally:
-            clients.discard(ws)
-            print(f"[ros_ws_bridge] client gone: {peer} ({len(clients)} total)")
-
-    async def _broadcast(frame: bytes) -> None:
+    async def _broadcast(frame: bytes, *, exclude=None) -> None:
         if not clients:
             return
         dead = []
         for ws in list(clients):
+            if ws is exclude:
+                continue
             try:
                 await ws.send(frame)
             except Exception:
                 dead.append(ws)
         for ws in dead:
             clients.discard(ws)
+
+    async def _handler(ws, *_compat) -> None:  # *_compat: legacy websockets passes a path arg
+        clients.add(ws)
+        peer = getattr(ws, "remote_address", None)
+        print(f"[ros_ws_bridge] client connected: {peer} ({len(clients)} total)")
+        try:
+            # Relay control frames (viser 'Send to Spot' -> the Spot driver):
+            # any inbound 'goto'/'cancel' frame is fanned out to every OTHER
+            # client. odom/image only ever flow outbound, so those are ignored.
+            async for msg in ws:
+                if isinstance(msg, str):
+                    msg = msg.encode("utf-8")
+                if len(msg) < 4:
+                    continue
+                (hlen,) = struct.unpack(">I", msg[:4])
+                if 4 + hlen > len(msg):
+                    continue
+                try:
+                    hdr = json.loads(msg[4 : 4 + hlen].decode("utf-8"))
+                except Exception:
+                    continue
+                if hdr.get("type") in ("goto", "cancel"):
+                    print(f"[ros_ws_bridge] relay {hdr.get('type')}: {hdr}")
+                    await _broadcast(msg, exclude=ws)
+        except Exception:
+            pass
+        finally:
+            clients.discard(ws)
+            print(f"[ros_ws_bridge] client gone: {peer} ({len(clients)} total)")
 
     async def _pump_odom() -> None:
         while True:

@@ -32,3 +32,6 @@ data/
 .vscode/
 .idea/
 .DS_Store
+
+# Spot robot credentials (never commit)
+scripts/spot_credentials.py

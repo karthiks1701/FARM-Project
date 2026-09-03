@@ -18,7 +18,7 @@ For each relational match the CLI also prints a **collision-aware navigation
 pose**: the object centroid is inside the object and unsafe as a robot goal, so
 ``scene_graph.retrieval.navigation_pose`` derives a nearby standoff pose clear of
 every other object's voxel evidence by at least ``--robot-radius-m`` +
-``--clearance-m`` (Spot ~0.5 m footprint + a few-cm safety barrier). Matches with
+``--clearance-m`` (Spot ~0.6 m footprint + a few-cm safety barrier). Matches with
 no body-safe pose within ``--nav-search-radius-m`` are flagged ``[UNSAFE]``
 rather than silently returned.
 """
@@ -47,7 +47,7 @@ def main() -> int:
                         help="Don't compute a collision-aware navigation pose for each match (relational path only).")
     parser.add_argument("--clearance-m", type=float, default=0.10,
                         help="Safety barrier (metres) kept between the robot footprint and any other object's voxels.")
-    parser.add_argument("--robot-radius-m", type=float, default=0.5,
+    parser.add_argument("--robot-radius-m", type=float, default=0.6,
                         help="Robot footprint half-width (metres); the nav pose keeps robot_radius + clearance from obstacles.")
     parser.add_argument("--nav-search-radius-m", type=float, default=2.5,
                         help="How far out from the object to search for a body-safe standoff pose.")
@@ -124,7 +124,14 @@ def main() -> int:
                 print(f"  #{rank} object_id={cand.object_id} score={cand.composite_score:.3f} {pos_str}{extra} {cap!r}")
                 nav = nav_poses.get(cand.object_index)
                 if nav is not None:
+                    nx, ny, _nz = nav.position
                     print(f"       {nav.summary()}  — {nav.note}")
+                    # Machine-readable seed-frame goal for a downstream planner:
+                    #   NAVGOAL <object_id> <x> <y> <yaw_rad> <navigable> <clearance_m>
+                    print(
+                        f"       NAVGOAL {cand.object_id} {nx:.4f} {ny:.4f} "
+                        f"{nav.yaw_rad:.5f} {int(bool(nav.navigable))} {nav.clearance_m:.3f}"
+                    )
             return 0
         except Exception as exc:  # noqa: BLE001 - degrade to embedding retrieval
             print(f"Relational path unavailable ({exc}); falling back to embedding retrieval.")

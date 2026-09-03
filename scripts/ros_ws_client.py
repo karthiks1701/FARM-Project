@@ -82,10 +82,15 @@ class RosWsClient:
         world_transform: Optional[np.ndarray] = None,
         want_image: bool = True,
         reconnect_max_s: float = 5.0,
+        on_control=None,
     ) -> None:
         self._url = str(url)
         self._want_image = bool(want_image)
         self._reconnect_max_s = max(0.5, float(reconnect_max_s))
+        # Called (in the asyncio thread) with the dict header of any inbound
+        # 'goto' / 'cancel' control frame relayed by the bridge. Keep it quick
+        # and thread-safe (e.g. push onto a queue.Queue).
+        self._on_control = on_control
         self._T_map_odom = (
             np.eye(4, dtype=np.float64)
             if world_transform is None
@@ -101,6 +106,7 @@ class RosWsClient:
 
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ws = None  # current open connection (asyncio thread only)
         self._stop = threading.Event()
 
     # -- lifecycle -------------------------------------------------------
@@ -141,6 +147,32 @@ class RosWsClient:
         with self._lock:
             return self._n_odom, self._n_image
 
+    def send(self, payload: dict) -> bool:
+        """Send a control message (e.g. a 'goto' goal) to the bridge, which
+        relays it to the other clients. Thread-safe; returns False if not
+        connected."""
+        loop = self._loop
+        if loop is None:
+            return False
+        try:
+            hb = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            frame = struct.pack(">I", len(hb)) + hb
+        except Exception:
+            return False
+        loop.call_soon_threadsafe(self._enqueue_send, frame)
+        return True
+
+    def _enqueue_send(self, frame: bytes) -> None:
+        ws = self._ws
+        if ws is None:
+            return
+        asyncio.create_task(self._safe_send(ws, frame))
+
+    @staticmethod
+    async def _safe_send(ws, frame: bytes) -> None:
+        with contextlib.suppress(Exception):
+            await ws.send(frame)
+
     # -- internals ----------------------------------------------------
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -161,6 +193,7 @@ class RosWsClient:
         while not self._stop.is_set():
             try:
                 async with connect(self._url, max_size=None, ping_interval=20, open_timeout=5) as ws:
+                    self._ws = ws
                     with self._lock:
                         self._connected = True
                     print(f"[ros_ws_client] connected to {self._url}")
@@ -173,6 +206,7 @@ class RosWsClient:
                 if not self._stop.is_set():
                     print(f"[ros_ws_client] disconnected ({exc}); retrying in {backoff:.1f}s")
             finally:
+                self._ws = None
                 with self._lock:
                     self._connected = False
             if self._stop.is_set():
@@ -198,6 +232,9 @@ class RosWsClient:
             self._handle_odom(header)
         elif kind == "image" and self._want_image:
             self._handle_image(header, payload)
+        elif kind in ("goto", "cancel") and self._on_control is not None:
+            with contextlib.suppress(Exception):
+                self._on_control(header)
 
     def _handle_odom(self, header: dict) -> None:
         try:
